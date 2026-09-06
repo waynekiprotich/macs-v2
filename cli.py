@@ -202,6 +202,30 @@ def _trade_stats(trades):
     return wins, losses, total, win_rate, total_pnl
 
 
+def _baseline_win_rate(df, expiry_bars: int, direction: str = 'BUY') -> float:
+    """
+    Control group: bet the SAME direction on every single bar, no strategy at all.
+
+    This is the bar that actually matters. If the underlying drifts upward over
+    the sample, "always CALL" wins >50% with precisely zero skill — so a
+    strategy scoring 52% isn't finding signal, it's just riding drift with extra
+    steps. Any honest claim of edge has to beat this number, not 50%.
+    """
+    wins = 0
+    total = 0
+    for i in range(210, len(df) - expiry_bars):
+        entry = df.iloc[i]['Close']
+        exit_price = df.iloc[i + expiry_bars]['Close']
+        won = (exit_price > entry) if direction == 'BUY' else (exit_price < entry)
+        wins += 1 if won else 0
+        total += 1
+    return (wins / total * 100) if total else 0.0
+
+
+# (bars at 15m interval, human label)
+DURATION_GRID = [(1, "15m"), (2, "30m"), (4, "1h"), (8, "2h"), (16, "4h"), (32, "8h"), (96, "24h")]
+
+
 @cli.command(name="equity-backtest")
 @click.option("--symbol", default="OTC_DJI", help="MACS symbol (OTC_DJI, frxXAUUSD) or raw yfinance ticker")
 @click.option("--days", default=59, help="Days of intraday history (yfinance caps 15m data at ~60d)")
@@ -209,7 +233,8 @@ def _trade_stats(trades):
 @click.option("--min-conditions", default=None, type=int, help="Override MACS_MIN_CONDITIONS for this run")
 @click.option("--payout", default=0.85, type=float, help="Assumed Deriv payout ratio for a correct call (e.g. 0.85 = 85%% return on win). Check the real proposal payout in your Deriv app/logs — it varies by symbol and market conditions and isn't something this strategy controls.")
 @click.option("--sweep", is_flag=True, help="Test every condition threshold 4-8 to find the best min_conditions")
-def backtest(symbol, days, interval, min_conditions, payout, sweep):
+@click.option("--duration-sweep", is_flag=True, help="Test contract durations 15m-24h at the chosen threshold — does the strategy have ANY edge at a longer horizon?")
+def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_sweep):
     """Backtest the fixed-duration CALL/PUT binary contract MACS actually buys (pure technical, no AI, no TP/SL — there is none in this product)."""
     from config.settings import settings
 
@@ -228,6 +253,38 @@ def backtest(symbol, days, interval, min_conditions, payout, sweep):
         console.print(f"[red]{err}[/]")
         return
 
+    if duration_sweep:
+        grid = Table(title=f"Contract Duration Sweep — {symbol} (at {fixed_threshold}/8 conditions, {payout*100:.0f}% payout)")
+        grid.add_column("Duration", style="cyan")
+        grid.add_column("Trades", style="bold")
+        grid.add_column("Win Rate")
+        grid.add_column("Always-CALL baseline")
+        grid.add_column("Edge vs baseline")
+        grid.add_column("Expectancy/Trade")
+
+        for bars, label in DURATION_GRID:
+            if len(df) - bars <= 210:
+                continue
+            trades = _simulate(df, fixed_threshold, payout, bars)
+            _, _, total, win_rate, total_pnl = _trade_stats(trades)
+            expectancy = (total_pnl / total) if total else 0.0
+            baseline = _baseline_win_rate(df, bars, 'BUY')
+            edge = win_rate - baseline
+            win_style = "green" if win_rate >= breakeven else "red" if total else "yellow"
+            edge_style = "green" if edge > 0 else "red"
+            grid.add_row(
+                label, str(total),
+                f"[{win_style}]{win_rate:.1f}%[/]",
+                f"{baseline:.1f}%",
+                f"[{edge_style}]{edge:+.1f} pts[/]",
+                f"{expectancy:.4f}",
+            )
+        console.print(grid)
+        console.print(f"[dim]'Always-CALL baseline' = betting CALL on every single bar with no strategy at all. If the "
+                      f"strategy's win rate doesn't clearly beat that column, it has no signal — it's riding drift. "
+                      f"And it still needs to clear {breakeven:.1f}% in absolute terms to make money at this payout.[/dim]")
+        return
+
     thresholds = range(4, 9) if sweep else [fixed_threshold]
 
     summary = Table(title=f"Backtest Results — {symbol} (fixed 15-min CALL/PUT, {payout*100:.0f}% payout)")
@@ -236,8 +293,11 @@ def backtest(symbol, days, interval, min_conditions, payout, sweep):
     summary.add_column("Wins")
     summary.add_column("Losses")
     summary.add_column("Win Rate")
+    summary.add_column("Baseline")
     summary.add_column("Total P&L (stakes)")
     summary.add_column("Expectancy/Trade")
+
+    baseline = _baseline_win_rate(df, expiry_bars, 'BUY')
 
     for threshold in thresholds:
         trades = _simulate(df, threshold, payout, expiry_bars)
@@ -248,13 +308,15 @@ def backtest(symbol, days, interval, min_conditions, payout, sweep):
         summary.add_row(
             str(threshold), str(total), str(len(wins)), str(len(losses)),
             f"[{win_style}]{win_rate:.1f}%[/]",
+            f"{baseline:.1f}%",
             f"[{pnl_style}]{total_pnl:.2f}[/]",
             f"{expectancy:.4f}",
         )
     console.print(summary)
     console.print(f"[dim]P&L is in units of stake (1.0 = one full stake). Win rate must clear {breakeven:.1f}% to be "
-                  f"profitable at this payout — that's the real bar, not 50%. Tune MACS_MIN_CONDITIONS in .env to "
-                  f"the threshold with the best win-rate/trade-count tradeoff above that line.[/dim]")
+                  f"profitable at this payout — that's the real bar, not 50%. 'Baseline' is what betting CALL on every "
+                  f"bar scores with no strategy at all; beating {breakeven:.1f}% while barely matching the baseline "
+                  f"means you're riding drift, not predicting.[/dim]")
 
 
 @cli.command()
