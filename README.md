@@ -46,12 +46,26 @@ python cli.py performance
 
 **Backtest** (models the real fixed-duration binary contract, not a made-up TP/SL barrier):
 ```bash
-python cli.py equity-backtest --symbol OTC_DJI --sweep              # test every condition threshold
-python cli.py equity-backtest --symbol OTC_DJI --duration-sweep     # test 15m-24h contract durations
+python cli.py equity-backtest --symbol OTC_DJI --sweep            # every condition threshold
+python cli.py equity-backtest --symbol OTC_DJI --duration-sweep   # 15m-24h contract durations
+python cli.py equity-backtest --symbol OTC_DJI --walk-forward     # out-of-sample: the honest one
+python cli.py equity-backtest --symbol OTC_DJI --slices           # by hour / volatility / regime
+python cli.py equity-backtest --symbol OTC_DJI --refresh          # bust the 12h data cache
 ```
-Every table includes an "always-CALL baseline" column — betting one direction on every bar with zero strategy. The strategy has to clearly beat that column, not just beat 50%, or it isn't finding signal.
+
+Reading these honestly matters more than running them:
+
+- **`--walk-forward` is the only non-in-sample result here.** It picks the best threshold on the first 70% of history and scores it on the last 30%. Everything else chooses a threshold by looking at the same bars it then grades, which flatters whichever candidate got luckiest.
+- **The "always-CALL baseline" column** is betting one direction on every bar with no strategy at all. If the underlying drifted up, that scores >50% with zero skill. Beat *that*, not 50%.
+- **`--slices` generates hypotheses, not results.** Run on synthetic random data with no edge by construction, it still surfaces hours at ~62% win rate. Cutting data 20 ways guarantees a winner by luck. Anything it finds must survive `--walk-forward` on data it wasn't discovered in.
+- **Breakeven is `1/(1+payout)`**, ~54.1% at an 85% payout — not 50%. `python cli.py performance` now reports your *real* payout ratio from Deriv's own quotes and whether live results clear it.
 
 `.env` needs `DERIV_API_TOKEN`, `DERIV_APP_ID` (demo account only — hardcoded in `data_deriv.py`), and `DATABASE_URL=sqlite:///macs.db`.
+
+**Never hardcode credentials in scripts.** A live API token was once committed here in two scratch files and pushed to GitHub, bypassing the gitignored `.env` entirely. There's a guard against a repeat:
+```bash
+ln -sf ../../scripts/check_secrets.sh .git/hooks/pre-commit
+```
 
 ## What actually needs to change
 
