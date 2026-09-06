@@ -12,7 +12,6 @@ except Exception as e:
     logger.warning(f"Could not load .env file: {e}")
 
 class Settings(BaseSettings):
-    GEMINI_API_KEY: str = ""
     ALPACA_API_KEY: str = ""
     ALPACA_SECRET_KEY: str = ""
     ALPACA_PAPER: bool = True

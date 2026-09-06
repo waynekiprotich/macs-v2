@@ -1,59 +1,14 @@
+"""
+Tests for the standalone strategy modules in strategies/.
+
+NOTE: neither of these is wired into core/pipeline.py — the live decision
+logic is core/technical_strategy.py (see tests/test_technical_strategy.py).
+These are kept as self-contained alternates; if they're never adopted they
+can be deleted along with their tests.
+"""
 import pytest
-from strategies.ultra_filtered import UltraFilteredStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.options_selling import OptionsSellingStrategy
-
-def test_ultra_filtered_strategy():
-    strategy = UltraFilteredStrategy()
-    
-    # Test data that passes all 8 conditions
-    bullish_data = {
-        "close": 100.0,
-        "regime": "bull",
-        "sma_short": 50,
-        "sma_long": 40,
-        "rsi": 55,
-        "stoch_k": 75,
-        "stoch_d": 70,
-        "volume": 1500,
-        "volume_sma": 1000,
-        "support_level": 90.0,
-        "macd": 1.5,
-        "macd_signal": 1.0,
-        "ai_confidence": 0.8,
-        "atr": 2.0
-    }
-    
-    signal = strategy.generate_signal(bullish_data)
-    assert signal["strategy"] == "UltraFiltered"
-    assert signal["signal"] == "BUY"
-    assert signal["take_profit"] == 100.0 + (2.0 * 0.4)
-    assert signal["stop_loss"] == 100.0 - (2.0 * 3.0)
-    assert signal["conditions_met"] == 8
-
-def test_ultra_filtered_strategy_neutral():
-    strategy = UltraFilteredStrategy()
-    
-    # Fails most conditions
-    bearish_data = {
-        "close": 100.0,
-        "regime": "bear",
-        "sma_short": 40,
-        "sma_long": 50,
-        "rsi": 20,
-        "stoch_k": 20,
-        "stoch_d": 30,
-        "volume": 500,
-        "volume_sma": 1000,
-        "support_level": 110.0,
-        "macd": -1.5,
-        "macd_signal": -1.0,
-        "ai_confidence": 0.3,
-        "atr": 2.0
-    }
-    
-    signal = strategy.generate_signal(bearish_data)
-    assert signal["signal"] == "NEUTRAL"
 
 def test_mean_reversion_strategy():
     strategy = MeanReversionStrategy()

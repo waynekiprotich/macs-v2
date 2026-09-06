@@ -9,3 +9,5 @@ macs.db
 venv/
 .pytest_cache/
 .heartbeat_state.json
+node_modules/
+dist/

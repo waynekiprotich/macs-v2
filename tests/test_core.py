@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 from core.indicators import compute_indicators
 from core.regime import detect_regime
-from core.scoring import calculate_technical_score
 
 def test_indicators_missing_data():
     df = pd.DataFrame({'Close': [100.0]})
@@ -20,13 +19,6 @@ def test_regime_neutral():
     })
     res = detect_regime(df)
     assert res.iloc[-1]['Regime'] == 'neutral'
-
-def test_signal_score_symmetry():
-    # Test top 20% vs bottom 20% math parity
-    buy_score = 85.0
-    sell_score = 15.0
-    assert buy_score > 80.0
-    assert (100 - sell_score) > 80.0
 
 def test_volatility_rejection():
     # High ATR triggers HOLD

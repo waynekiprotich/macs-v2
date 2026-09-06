@@ -6,7 +6,6 @@ yfinance==0.2.54
 pandas==2.2.2
 numpy==1.26.4
 ta==0.11.0
-google-generativeai==0.7.2
 alpaca-trade-api==3.2.0
 python_deriv_api==0.1.7
 # Pinned explicitly: alpaca-trade-api needs <11, python_deriv_api needs ==10.3,
