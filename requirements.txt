@@ -2,12 +2,20 @@ fastapi
 uvicorn==0.30.1
 pydantic
 pydantic-settings
-yfinance==0.2.38
+yfinance==0.2.54
 pandas==2.2.2
 numpy==1.26.4
 ta==0.11.0
 google-generativeai==0.7.2
 alpaca-trade-api==3.2.0
+python_deriv_api==0.1.7
+# Pinned explicitly: alpaca-trade-api needs <11, python_deriv_api needs ==10.3,
+# and data_deriv.py's live Deriv websocket connection depends on this exact
+# API shape. yfinance>=1.0 forces websockets>=13 (its optional live-streaming
+# feature) which is a HARD import at module load and will break the live
+# trading connection if it's ever allowed to upgrade this — do not bump
+# yfinance past the 0.2.x series without re-pinning websockets afterward.
+websockets==10.3
 APScheduler==3.10.4
 sqlalchemy==2.0.30
 click==8.1.7
