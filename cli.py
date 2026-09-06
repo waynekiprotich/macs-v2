@@ -101,41 +101,70 @@ SYMBOL_PROXY = {
 }
 
 
-def _fetch_backtest_data(symbol: str, interval: str, period: str):
-    """Fetch + prepare indicators ONCE. Reused across every threshold in a
-    --sweep so we don't hammer yfinance with N identical requests (that's
-    the fastest way to get rate-limited) and each threshold is compared
-    against the exact same bars, not a fresh fetch that could differ."""
+CACHE_DIR = ".backtest_cache"
+CACHE_MAX_AGE_HOURS = 12
+
+
+def _fetch_backtest_data(symbol: str, interval: str, period: str, refresh: bool = False):
+    """Fetch + prepare indicators ONCE, with an on-disk cache.
+
+    Yahoo rate-limits aggressively, and a --sweep or --walk-forward re-reads
+    the same bars many times. Caching to disk means one fetch serves every
+    subsequent analysis of the same symbol/interval/period, which is both
+    faster and the difference between being able to iterate at all and
+    spending the session waiting out throttles. Pass --refresh to force a
+    re-fetch; cache expires after CACHE_MAX_AGE_HOURS anyway.
+    """
+    import os
     import time
-    import yfinance as yf
-    from yfinance.exceptions import YFRateLimitError
+    import pandas as pd
     from core.indicators import compute_indicators
     from core.regime import detect_regime
     from core import technical_strategy
 
     proxy = SYMBOL_PROXY.get(symbol, symbol)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, f"{proxy.replace('^','').replace('=','_')}_{interval}_{period}.pkl")
 
     df = None
-    last_err = None
-    for attempt in range(3):
-        try:
-            df = yf.Ticker(proxy).history(period=period, interval=interval)
-            break
-        except YFRateLimitError as e:
-            last_err = e
-            if attempt < 2:
-                wait = 15 * (attempt + 1)
-                console.print(f"[yellow]Rate limited by Yahoo Finance, waiting {wait}s and retrying ({attempt + 1}/3)...[/]")
-                time.sleep(wait)
-        except Exception as e:
-            return None, f"yfinance fetch failed: {e}"
+    if not refresh and os.path.exists(cache_path):
+        age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+        if age_hours < CACHE_MAX_AGE_HOURS:
+            try:
+                df = pd.read_pickle(cache_path)
+                console.print(f"[dim]Using cached data ({age_hours:.1f}h old, {len(df)} raw bars). --refresh to re-fetch.[/dim]")
+            except Exception:
+                df = None
 
     if df is None:
-        return None, (
-            f"Still rate-limited by Yahoo Finance after 3 attempts for {proxy}. "
-            "This is Yahoo throttling your IP, not a code bug — wait a few minutes "
-            "and try again, ideally with a single --min-conditions run instead of --sweep."
-        )
+        import yfinance as yf
+        from yfinance.exceptions import YFRateLimitError
+        for attempt in range(3):
+            try:
+                df = yf.Ticker(proxy).history(period=period, interval=interval)
+                break
+            except YFRateLimitError:
+                if attempt < 2:
+                    wait = 15 * (attempt + 1)
+                    console.print(f"[yellow]Rate limited by Yahoo Finance, waiting {wait}s and retrying ({attempt + 1}/3)...[/]")
+                    time.sleep(wait)
+                else:
+                    df = None
+            except Exception as e:
+                return None, f"yfinance fetch failed: {e}"
+
+        if df is None:
+            return None, (
+                f"Still rate-limited by Yahoo Finance after 3 attempts for {proxy}, and no usable cache. "
+                "Wait a few minutes and retry — once one fetch succeeds it's cached for "
+                f"{CACHE_MAX_AGE_HOURS}h and every later sweep reuses it."
+            )
+        if not df.empty:
+            try:
+                df.to_pickle(cache_path)
+            except Exception as e:
+                logger.warning(f"Could not write backtest cache: {e}")
+
     if df.empty:
         return None, f"No data returned for {proxy} ({period}/{interval})"
 
@@ -226,6 +255,43 @@ def _baseline_win_rate(df, expiry_bars: int, direction: str = 'BUY') -> float:
 DURATION_GRID = [(1, "15m"), (2, "30m"), (4, "1h"), (8, "2h"), (16, "4h"), (32, "8h"), (96, "24h")]
 
 
+def _walk_forward(df, payout_pct: float, expiry_bars: int, train_frac: float = 0.7):
+    """
+    The honest test: pick the best threshold on the FIRST chunk of history,
+    then measure that same threshold on data it has never seen.
+
+    Every other number this tool reports is in-sample — the threshold was
+    chosen by looking at the same bars it's scored on, which guarantees the
+    winner looks good whether or not it has any predictive power. Picking on
+    train and scoring on test is what separates a real effect from having
+    selected the luckiest noise out of five candidates.
+
+    Returns (train_rows, test_rows, chosen_threshold, split_index).
+    """
+    split = int(len(df) * train_frac)
+    train_df, test_df = df.iloc[:split], df.iloc[split:]
+
+    train_rows, test_rows = [], []
+    best_threshold, best_expectancy = None, None
+
+    for threshold in range(4, 9):
+        trades = _simulate(train_df, threshold, payout_pct, expiry_bars)
+        _, _, total, win_rate, total_pnl = _trade_stats(trades)
+        expectancy = (total_pnl / total) if total else 0.0
+        train_rows.append((threshold, total, win_rate, total_pnl, expectancy))
+        # Require a minimum sample so a 2-trade fluke can't win the selection.
+        if total >= 30 and (best_expectancy is None or expectancy > best_expectancy):
+            best_threshold, best_expectancy = threshold, expectancy
+
+    for threshold in range(4, 9):
+        trades = _simulate(test_df, threshold, payout_pct, expiry_bars)
+        _, _, total, win_rate, total_pnl = _trade_stats(trades)
+        expectancy = (total_pnl / total) if total else 0.0
+        test_rows.append((threshold, total, win_rate, total_pnl, expectancy))
+
+    return train_rows, test_rows, best_threshold, split
+
+
 @cli.command(name="equity-backtest")
 @click.option("--symbol", default="OTC_DJI", help="MACS symbol (OTC_DJI, frxXAUUSD) or raw yfinance ticker")
 @click.option("--days", default=59, help="Days of intraday history (yfinance caps 15m data at ~60d)")
@@ -234,7 +300,9 @@ DURATION_GRID = [(1, "15m"), (2, "30m"), (4, "1h"), (8, "2h"), (16, "4h"), (32, 
 @click.option("--payout", default=0.85, type=float, help="Assumed Deriv payout ratio for a correct call (e.g. 0.85 = 85%% return on win). Check the real proposal payout in your Deriv app/logs — it varies by symbol and market conditions and isn't something this strategy controls.")
 @click.option("--sweep", is_flag=True, help="Test every condition threshold 4-8 to find the best min_conditions")
 @click.option("--duration-sweep", is_flag=True, help="Test contract durations 15m-24h at the chosen threshold — does the strategy have ANY edge at a longer horizon?")
-def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_sweep):
+@click.option("--walk-forward", is_flag=True, help="Pick the best threshold on the first 70%% of history, then score it on the unseen last 30%% — the only result here that isn't in-sample")
+@click.option("--refresh", is_flag=True, help="Force a re-fetch instead of using cached data")
+def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_sweep, walk_forward, refresh):
     """Backtest the fixed-duration CALL/PUT binary contract MACS actually buys (pure technical, no AI, no TP/SL — there is none in this product)."""
     from config.settings import settings
 
@@ -248,9 +316,50 @@ def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_swe
     if interval != "15m":
         console.print(f"[yellow]Warning: --interval {interval} means {expiry_bars} bar(s) approximate a 15-min expiry — for an exact match use --interval 15m.[/]")
 
-    df, err = _fetch_backtest_data(symbol, interval, f"{days}d")
+    df, err = _fetch_backtest_data(symbol, interval, f"{days}d", refresh=refresh)
     if err:
         console.print(f"[red]{err}[/]")
+        return
+
+    if walk_forward:
+        train_rows, test_rows, chosen, split = _walk_forward(df, payout, expiry_bars)
+
+        wf = Table(title=f"Walk-Forward — {symbol} (train: first {split} bars, test: last {len(df)-split} unseen bars)")
+        wf.add_column("Min Conditions", style="cyan")
+        wf.add_column("Train Trades")
+        wf.add_column("Train Win%")
+        wf.add_column("Train Exp/Trade")
+        wf.add_column("Test Trades")
+        wf.add_column("Test Win%")
+        wf.add_column("Test Exp/Trade")
+
+        test_by_threshold = {r[0]: r for r in test_rows}
+        for threshold, tot, wr, pnl, exp in train_rows:
+            t_thr, t_tot, t_wr, t_pnl, t_exp = test_by_threshold[threshold]
+            marker = " ← picked" if threshold == chosen else ""
+            tr_style = "green" if exp > 0 else "red"
+            te_style = "green" if t_exp > 0 else "red"
+            wf.add_row(
+                f"{threshold}{marker}", str(tot), f"{wr:.1f}%",
+                f"[{tr_style}]{exp:+.4f}[/]",
+                str(t_tot), f"{t_wr:.1f}%",
+                f"[{te_style}]{t_exp:+.4f}[/]",
+            )
+        console.print(wf)
+
+        if chosen is None:
+            console.print("[yellow]No threshold produced enough training trades (min 30) to select from.[/]")
+        else:
+            picked_test = test_by_threshold[chosen]
+            verdict_style = "green" if picked_test[4] > 0 else "red"
+            console.print(
+                f"[bold]Out-of-sample result:[/] threshold {chosen}/8 was best on training data, and on unseen data "
+                f"it scored [{verdict_style}]{picked_test[2]:.1f}% win rate, {picked_test[4]:+.4f} expectancy/trade[/] "
+                f"over {picked_test[1]} trades (breakeven needs {breakeven:.1f}%)."
+            )
+            console.print("[dim]If the picked threshold's test expectancy is negative while its train expectancy was "
+                          "positive, the training result was selection noise, not signal. That's the failure mode this "
+                          "whole split exists to catch.[/dim]")
         return
 
     if duration_sweep:

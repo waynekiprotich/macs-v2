@@ -11,3 +11,4 @@ venv/
 .heartbeat_state.json
 node_modules/
 dist/
+.backtest_cache/

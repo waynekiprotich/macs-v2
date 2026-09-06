@@ -57,6 +57,19 @@ def compute_metrics(symbol: str = None) -> Dict[str, Any]:
             else:
                 streak = 0
 
+        # Real payout ratio as quoted by Deriv at buy time, averaged over
+        # trades that recorded it. This is the number that sets the bar:
+        # breakeven win rate = stake/payout, so a 0.85 ratio needs 54.1%
+        # accuracy. Compare it against whatever --payout you assumed in the
+        # backtest — if the real ratio is worse, the backtest was optimistic.
+        payout_ratios = [
+            (t.payout - t.price) / t.price
+            for t in trades
+            if t.payout is not None and t.price
+        ]
+        avg_payout_ratio = (sum(payout_ratios) / len(payout_ratios)) if payout_ratios else None
+        breakeven_win_rate = (100 / (1 + avg_payout_ratio)) if avg_payout_ratio else None
+
         # Breakdown by the confidence/condition-count the signal fired at,
         # so you can see whether higher confidence actually correlates with wins.
         by_confidence = {}
@@ -85,6 +98,8 @@ def compute_metrics(symbol: str = None) -> Dict[str, Any]:
             "reward_risk_ratio": round(reward_risk, 2) if reward_risk != float('inf') else "inf",
             "max_drawdown": round(max_dd, 2),
             "worst_losing_streak": worst_streak,
+            "avg_payout_ratio": round(avg_payout_ratio, 4) if avg_payout_ratio else None,
+            "breakeven_win_rate": round(breakeven_win_rate, 2) if breakeven_win_rate else None,
             "by_confidence_bucket": by_confidence,
         }
     finally:
@@ -119,7 +134,22 @@ def print_report(symbol: str = None):
     table.add_row("Max Drawdown", str(metrics["max_drawdown"]))
     table.add_row("Worst Losing Streak", str(metrics["worst_losing_streak"]))
 
+    if metrics["avg_payout_ratio"] is not None:
+        be = metrics["breakeven_win_rate"]
+        clears = metrics["win_rate_pct"] >= be
+        be_style = "green" if clears else "red"
+        table.add_row("Avg Payout Ratio (real)", f"{metrics['avg_payout_ratio']:.2%}")
+        table.add_row("Breakeven Win Rate", f"[{be_style}]{be}%[/]")
+        table.add_row(
+            "Clears Breakeven?",
+            f"[{be_style}]{'YES' if clears else 'NO'}[/]",
+        )
+
     console.print(table)
+
+    if metrics["avg_payout_ratio"] is None:
+        console.print("[dim]No real payout data recorded yet — payout is captured at buy time from Deriv's "
+                      "proposal, so it appears once trades placed after this change have executed.[/dim]")
 
     if metrics["by_confidence_bucket"]:
         conf_table = Table(title="Win Rate by Confidence Bucket")

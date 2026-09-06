@@ -74,7 +74,14 @@ class DerivEngine(BaseEngine):
                 "contract_id": contract_id,
                 "proposal_id": proposal_id,
                 "buy_price": buy_price,
-                "contract_type": contract_type
+                "contract_type": contract_type,
+                # Deriv's quoted payout for a winning contract. Captured at buy
+                # time because it's the single number that decides whether this
+                # system can be profitable at all: breakeven win rate is
+                # stake/payout, so a 0.85 ratio needs 54.1% accuracy. It was
+                # previously logged and discarded, which left cli.py's
+                # --payout backtest flag as an unverifiable guess.
+                "payout": payout,
             }
 
     def execute_signal(self, symbol: str, signal: str, quantity: float, price: float, reason: str = "",
@@ -105,6 +112,7 @@ class DerivEngine(BaseEngine):
                 reason=reason,
                 contract_id=str(result['contract_id']),
                 proposal_id=str(result.get('proposal_id', '')),
+                payout=float(result['payout']) if result.get('payout') is not None else None,
                 tech_score=tech_score,
                 ai_score=ai_score,
                 confidence=confidence,
