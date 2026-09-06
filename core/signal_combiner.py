@@ -1,3 +1,7 @@
+# DEPRECATED: no longer called by core/pipeline.py — superseded by
+# core/technical_strategy.generate_signal(), which is symmetric (BUY+SELL)
+# and doesn't depend on the shallow Tech_Score from core/scoring.py.
+# Kept only because test_volatility.py still imports it.
 import logging
 import pandas as pd
 

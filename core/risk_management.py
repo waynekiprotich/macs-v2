@@ -31,13 +31,13 @@ class RiskManager:
             # Daily PNL
             result = db.query(func.sum(PaperTrade.pnl)).filter(
                 PaperTrade.timestamp >= today_start,
-                PaperTrade.status == 'closed'
+                PaperTrade.status == 'CLOSED'
             ).scalar()
             self.daily_pnl = result if result else 0.0
             
             # Consecutive losses
             recent_trades = db.query(PaperTrade).filter(
-                PaperTrade.status == 'closed'
+                PaperTrade.status == 'CLOSED'
             ).order_by(PaperTrade.timestamp.desc()).limit(self.consecutive_loss_limit).all()
             
             losses = 0

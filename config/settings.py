@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     MACS_INTERVAL_MINUTES: int = 5
     MACS_MAX_CONSECUTIVE_LOSSES: int = 3
     MACS_MIN_CONFIDENCE_SCORE: float = 80.0
+    # Pure technical strategy (core/technical_strategy.py): out of 8 symmetric
+    # conditions, how many must agree before a BUY/SELL fires. Tune this with
+    # `python cli.py backtest` — this is the single biggest lever on win rate
+    # vs. trade frequency.
+    MACS_MIN_CONDITIONS: int = 6
     DATABASE_URL: str = "sqlite:///macs.db"
     DISCORD_WEBHOOK_URL: str = ""
 

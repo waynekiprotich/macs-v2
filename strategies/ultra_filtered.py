@@ -1,3 +1,10 @@
+# DEPRECATED: this was the strategy the OLD backtest command tested, but it
+# was never actually wired into core/pipeline.py's live path (which ran a
+# separate, weaker 4-factor Tech_Score instead) — a split-brain bug where
+# backtest results told you nothing about live behavior. Superseded by
+# core/technical_strategy.py, which both live trading (pipeline.py) and
+# `cli.py backtest` now share. Kept only because tests/test_strategies.py
+# still imports it.
 import pandas as pd
 import numpy as np
 import logging

@@ -3,4 +3,9 @@
 __pycache__/
 *.pyc
 *.log
+*.err
+*.orig
 macs.db
+venv/
+.pytest_cache/
+.heartbeat_state.json

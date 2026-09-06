@@ -1,3 +1,9 @@
+# DEPRECATED: no longer used by core/pipeline.py. The AI-blended scoring here
+# was replaced by core/technical_strategy.py (pure technical, no AI) per
+# decision to drop the free-tier Gemini dependency entirely rather than try
+# to make it reliable. Kept only because tests/test_core.py and
+# tests/test_pipeline.py still import from it — update those and delete this
+# file once they're migrated.
 import pandas as pd
 import logging
 import json
