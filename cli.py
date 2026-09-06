@@ -255,6 +255,71 @@ def _baseline_win_rate(df, expiry_bars: int, direction: str = 'BUY') -> float:
 DURATION_GRID = [(1, "15m"), (2, "30m"), (4, "1h"), (8, "2h"), (16, "4h"), (32, "8h"), (96, "24h")]
 
 
+def _slice_trades(df, min_conditions: int, payout_pct: float, expiry_bars: int):
+    """
+    Re-run the strategy but keep the context of each trade, so results can be
+    cut by hour-of-day, volatility state, regime, and direction.
+
+    The point is to check whether the edge exists in some *subset* even though
+    it's absent overall — e.g. only during the London/NY overlap, or only in
+    calm conditions. This is the cheapest remaining research question, but it
+    is also where overfitting is easiest: slicing 20 ways guarantees some slice
+    looks good by chance, so treat anything found here as a hypothesis to test
+    with --walk-forward, never as a result.
+    """
+    from core import technical_strategy
+
+    rows = []
+    for i in range(210, len(df) - expiry_bars):
+        row = df.iloc[i]
+        is_volatile = bool(row.get('Is_Volatile', False))
+        sig = technical_strategy.generate_signal(row, min_conditions=min_conditions, is_volatile=is_volatile)
+        if sig['signal'] not in ('BUY', 'SELL'):
+            continue
+        entry = row['Close']
+        exit_price = df.iloc[i + expiry_bars]['Close']
+        won = (exit_price > entry) if sig['signal'] == 'BUY' else (exit_price < entry)
+        rows.append({
+            'hour': df.index[i].hour,
+            'volatile': is_volatile,
+            'regime': row.get('Regime', 'unknown'),
+            'direction': sig['signal'],
+            'won': won,
+            'pnl': payout_pct if won else -1.0,
+        })
+    return rows
+
+
+def _slice_table(rows, key, title, breakeven, min_n=20):
+    """Aggregate trades by one dimension, hiding slices too small to mean anything."""
+    buckets = {}
+    for r in rows:
+        buckets.setdefault(r[key], []).append(r)
+
+    table = Table(title=title)
+    table.add_column(key.title(), style="cyan")
+    table.add_column("Trades")
+    table.add_column("Win Rate")
+    table.add_column("Exp/Trade")
+
+    # Numeric keys (hour) must sort numerically, not as strings — otherwise
+    # the hour column reads 0, 1, 10, 11, ..., 2, 20 and is unusable.
+    def _sort_key(x):
+        return (0, x) if isinstance(x, (int, float)) else (1, str(x))
+
+    for k in sorted(buckets, key=_sort_key):
+        group = buckets[k]
+        n = len(group)
+        if n < min_n:
+            continue
+        wins = sum(1 for g in group if g['won'])
+        wr = wins / n * 100
+        exp = sum(g['pnl'] for g in group) / n
+        style = "green" if wr >= breakeven else "red"
+        table.add_row(str(k), str(n), f"[{style}]{wr:.1f}%[/]", f"{exp:+.4f}")
+    return table
+
+
 def _walk_forward(df, payout_pct: float, expiry_bars: int, train_frac: float = 0.7):
     """
     The honest test: pick the best threshold on the FIRST chunk of history,
@@ -301,8 +366,9 @@ def _walk_forward(df, payout_pct: float, expiry_bars: int, train_frac: float = 0
 @click.option("--sweep", is_flag=True, help="Test every condition threshold 4-8 to find the best min_conditions")
 @click.option("--duration-sweep", is_flag=True, help="Test contract durations 15m-24h at the chosen threshold — does the strategy have ANY edge at a longer horizon?")
 @click.option("--walk-forward", is_flag=True, help="Pick the best threshold on the first 70%% of history, then score it on the unseen last 30%% — the only result here that isn't in-sample")
+@click.option("--slices", is_flag=True, help="Break results down by hour-of-day, volatility, regime and direction — does an edge exist in some subset?")
 @click.option("--refresh", is_flag=True, help="Force a re-fetch instead of using cached data")
-def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_sweep, walk_forward, refresh):
+def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_sweep, walk_forward, slices, refresh):
     """Backtest the fixed-duration CALL/PUT binary contract MACS actually buys (pure technical, no AI, no TP/SL — there is none in this product)."""
     from config.settings import settings
 
@@ -319,6 +385,30 @@ def backtest(symbol, days, interval, min_conditions, payout, sweep, duration_swe
     df, err = _fetch_backtest_data(symbol, interval, f"{days}d", refresh=refresh)
     if err:
         console.print(f"[red]{err}[/]")
+        return
+
+    if slices:
+        rows = _slice_trades(df, fixed_threshold, payout, expiry_bars)
+        if not rows:
+            console.print(f"[yellow]No trades at {fixed_threshold}/8 conditions — nothing to slice.[/]")
+            return
+
+        overall_wr = sum(1 for r in rows if r['won']) / len(rows) * 100
+        console.print(f"[bold]Overall:[/] {len(rows)} trades, {overall_wr:.1f}% win rate "
+                      f"(breakeven {breakeven:.1f}%) at {fixed_threshold}/8 conditions\n")
+
+        for key, title in [
+            ('hour', 'By Hour of Day (UTC)'),
+            ('volatile', 'By Volatility Filter'),
+            ('regime', 'By Market Regime'),
+            ('direction', 'By Signal Direction'),
+        ]:
+            console.print(_slice_table(rows, key, title, breakeven))
+
+        console.print("[dim]Slices with fewer than 20 trades are hidden as meaningless. Read this as hypothesis "
+                      "generation, NOT as a result: cutting the data ~20 ways all but guarantees one slice clears "
+                      "breakeven on luck alone. Anything promising here must be re-tested with --walk-forward on "
+                      "data it wasn't discovered in before you believe it.[/dim]")
         return
 
     if walk_forward:
