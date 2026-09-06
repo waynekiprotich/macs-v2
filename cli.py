@@ -101,17 +101,41 @@ SYMBOL_PROXY = {
 }
 
 
-def _run_backtest(symbol: str, interval: str, period: str, min_conditions: int):
-    """Shared core: runs the SAME technical_strategy used live, bar by bar,
-    simulating a fixed-payout Rise/Fall contract per signal (not a held equity
-    position) so results are actually representative of what MACS trades."""
+def _fetch_backtest_data(symbol: str, interval: str, period: str):
+    """Fetch + prepare indicators ONCE. Reused across every threshold in a
+    --sweep so we don't hammer yfinance with N identical requests (that's
+    the fastest way to get rate-limited) and each threshold is compared
+    against the exact same bars, not a fresh fetch that could differ."""
+    import time
     import yfinance as yf
+    from yfinance.exceptions import YFRateLimitError
     from core.indicators import compute_indicators
     from core.regime import detect_regime
     from core import technical_strategy
 
     proxy = SYMBOL_PROXY.get(symbol, symbol)
-    df = yf.Ticker(proxy).history(period=period, interval=interval)
+
+    df = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.Ticker(proxy).history(period=period, interval=interval)
+            break
+        except YFRateLimitError as e:
+            last_err = e
+            if attempt < 2:
+                wait = 15 * (attempt + 1)
+                console.print(f"[yellow]Rate limited by Yahoo Finance, waiting {wait}s and retrying ({attempt + 1}/3)...[/]")
+                time.sleep(wait)
+        except Exception as e:
+            return None, f"yfinance fetch failed: {e}"
+
+    if df is None:
+        return None, (
+            f"Still rate-limited by Yahoo Finance after 3 attempts for {proxy}. "
+            "This is Yahoo throttling your IP, not a code bug — wait a few minutes "
+            "and try again, ideally with a single --min-conditions run instead of --sweep."
+        )
     if df.empty:
         return None, f"No data returned for {proxy} ({period}/{interval})"
 
@@ -121,11 +145,24 @@ def _run_backtest(symbol: str, interval: str, period: str, min_conditions: int):
     if df.empty:
         return None, "No data left after indicator warm-up window"
 
+    return df, None
+
+
+def _simulate(df, min_conditions: int, tp_multiplier: float = 0.4, sl_multiplier: float = 3.0):
+    """Pure computation over already-fetched data — runs the SAME
+    technical_strategy used live, bar by bar, simulating a fixed-payout
+    Rise/Fall contract per signal (not a held equity position) so results
+    are actually representative of what MACS trades."""
+    from core import technical_strategy
+
     trades = []
     for i in range(210, len(df)):
         row = df.iloc[i]
         is_volatile = bool(row.get('Is_Volatile', False))
-        sig = technical_strategy.generate_signal(row, min_conditions=min_conditions, is_volatile=is_volatile)
+        sig = technical_strategy.generate_signal(
+            row, min_conditions=min_conditions, is_volatile=is_volatile,
+            tp_multiplier=tp_multiplier, sl_multiplier=sl_multiplier,
+        )
         if sig['signal'] not in ('BUY', 'SELL'):
             continue
 
@@ -156,7 +193,21 @@ def _run_backtest(symbol: str, interval: str, period: str, min_conditions: int):
             "conditions": sig['reason'], "result": outcome[0], "pnl": outcome[1],
         })
 
-    return trades, None
+    return trades
+
+
+TP_GRID = [0.4, 0.8, 1.2, 1.6, 2.0]
+SL_GRID = [0.4, 0.8, 1.2, 1.6, 2.0, 3.0]
+BASELINE_TP, BASELINE_SL = 0.4, 3.0
+
+
+def _trade_stats(trades):
+    wins = [t for t in trades if t['result'] == 'TP']
+    losses = [t for t in trades if t['result'] == 'SL']
+    total = len(wins) + len(losses)
+    win_rate = (len(wins) / total * 100) if total else 0.0
+    total_pnl = sum(t['pnl'] for t in trades)
+    return wins, losses, total, win_rate, total_pnl
 
 
 @cli.command(name="equity-backtest")
@@ -164,46 +215,83 @@ def _run_backtest(symbol: str, interval: str, period: str, min_conditions: int):
 @click.option("--days", default=59, help="Days of intraday history (yfinance caps 15m data at ~60d)")
 @click.option("--interval", default="15m", help="Bar interval — match your live granularity")
 @click.option("--min-conditions", default=None, type=int, help="Override MACS_MIN_CONDITIONS for this run")
-@click.option("--sweep", is_flag=True, help="Test every threshold 4-8 to find the best min_conditions")
-def backtest(symbol, days, interval, min_conditions, sweep):
+@click.option("--sweep", is_flag=True, help="Test every condition threshold 4-8 to find the best min_conditions")
+@click.option("--tpsl-sweep", is_flag=True, help="Test a grid of TP/SL multipliers (at the chosen min-conditions) to find the best payout ratio")
+def backtest(symbol, days, interval, min_conditions, sweep, tpsl_sweep):
     """Backtest the SAME technical_strategy that trades live (pure technical, no AI)."""
     from config.settings import settings
 
+    fixed_threshold = min_conditions or settings.MACS_MIN_CONDITIONS
     console.print(f"[bold cyan]MACS Backtest[/] — {symbol} ({days}d @ {interval}) — proxy: {SYMBOL_PROXY.get(symbol, symbol)}")
-    console.print("[dim]Simulates fixed-payout Rise/Fall style exits (first TP/SL hit within 40 bars), matching live TP=0.4xATR / SL=3xATR.[/dim]")
+    console.print("[dim]Simulates fixed-payout Rise/Fall style exits (first TP/SL hit within 40 bars).[/dim]")
 
-    thresholds = range(4, 9) if sweep else [min_conditions or settings.MACS_MIN_CONDITIONS]
+    df, err = _fetch_backtest_data(symbol, interval, f"{days}d")
+    if err:
+        console.print(f"[red]{err}[/]")
+        return
 
-    summary = Table(title=f"Backtest Results — {symbol}")
-    summary.add_column("Min Conditions", style="cyan")
-    summary.add_column("Trades", style="bold")
-    summary.add_column("Wins")
-    summary.add_column("Losses")
-    summary.add_column("Win Rate")
-    summary.add_column("Total P&L")
+    if sweep:
+        summary = Table(title=f"Condition Threshold Sweep — {symbol} (TP={BASELINE_TP}x/SL={BASELINE_SL}x ATR)")
+        summary.add_column("Min Conditions", style="cyan")
+        summary.add_column("Trades", style="bold")
+        summary.add_column("Wins")
+        summary.add_column("Losses")
+        summary.add_column("Win Rate")
+        summary.add_column("Total P&L")
 
-    for threshold in thresholds:
-        trades, err = _run_backtest(symbol, interval, f"{days}d", threshold)
-        if err:
-            console.print(f"[red]{err}[/]")
-            return
+        for threshold in range(4, 9):
+            trades = _simulate(df, threshold, BASELINE_TP, BASELINE_SL)
+            wins, losses, total, win_rate, total_pnl = _trade_stats(trades)
+            win_style = "green" if win_rate >= 55 else "red" if total else "yellow"
+            pnl_style = "green" if total_pnl > 0 else "red"
+            summary.add_row(
+                str(threshold), str(total), str(len(wins)), str(len(losses)),
+                f"[{win_style}]{win_rate:.1f}%[/]",
+                f"[{pnl_style}]{total_pnl:.2f}[/]",
+            )
+        console.print(summary)
+        console.print("[dim]Tune MACS_MIN_CONDITIONS in .env to the threshold with the best win-rate/trade-count tradeoff.[/dim]")
 
-        wins = [t for t in trades if t['result'] == 'TP']
-        losses = [t for t in trades if t['result'] == 'SL']
-        total = len(wins) + len(losses)
-        win_rate = (len(wins) / total * 100) if total else 0.0
-        total_pnl = sum(t['pnl'] for t in trades)
+    if tpsl_sweep:
+        results = []
+        for tp in TP_GRID:
+            for sl in SL_GRID:
+                trades = _simulate(df, fixed_threshold, tp, sl)
+                wins, losses, total, win_rate, total_pnl = _trade_stats(trades)
+                expectancy = (total_pnl / total) if total else 0.0
+                results.append((tp, sl, total, len(wins), len(losses), win_rate, total_pnl, expectancy))
 
-        win_style = "green" if win_rate >= 55 else "red" if total else "yellow"
-        pnl_style = "green" if total_pnl > 0 else "red"
-        summary.add_row(
-            str(threshold), str(total), str(len(wins)), str(len(losses)),
-            f"[{win_style}]{win_rate:.1f}%[/]",
-            f"[{pnl_style}]{total_pnl:.2f}[/]",
-        )
+        # Always show the current live baseline, then the best-by-total-P&L combos.
+        baseline = next((r for r in results if r[0] == BASELINE_TP and r[1] == BASELINE_SL), None)
+        ranked = sorted(results, key=lambda r: r[6], reverse=True)
 
-    console.print(summary)
-    console.print("[dim]Tune MACS_MIN_CONDITIONS in .env to the threshold with the best win-rate/trade-count tradeoff — higher = fewer, more selective trades.[/dim]")
+        grid = Table(title=f"TP/SL Multiplier Sweep — {symbol} (fixed at {fixed_threshold}/8 conditions)")
+        grid.add_column("TP (xATR)", style="cyan")
+        grid.add_column("SL (xATR)", style="cyan")
+        grid.add_column("Ratio TP:SL")
+        grid.add_column("Trades")
+        grid.add_column("Win Rate")
+        grid.add_column("Total P&L")
+        grid.add_column("Exp/Trade")
+
+        def _add_row(r, tag=""):
+            tp, sl, total, w, l, win_rate, total_pnl, expectancy = r
+            pnl_style = "green" if total_pnl > 0 else "red" if total else "yellow"
+            grid.add_row(
+                f"{tp:.1f}{tag}", f"{sl:.1f}", f"1:{sl/tp:.1f}", str(total),
+                f"{win_rate:.1f}%", f"[{pnl_style}]{total_pnl:.2f}[/]", f"{expectancy:.4f}",
+            )
+
+        if baseline:
+            _add_row(baseline, tag=" (current live)")
+        for r in ranked[:10]:
+            if baseline and r[0] == baseline[0] and r[1] == baseline[1]:
+                continue
+            _add_row(r)
+
+        console.print(grid)
+        console.print(f"[dim]Fixed at {fixed_threshold}/8 conditions (pass --min-conditions to test a different threshold). "
+                       f"Ranked by total P&L, current live baseline (0.4/3.0) always shown first for comparison.[/dim]")
 
 
 @cli.command()

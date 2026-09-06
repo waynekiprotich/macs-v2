@@ -164,11 +164,18 @@ def evaluate_row(row: pd.Series) -> Dict[str, Any]:
     return detail
 
 
-def generate_signal(row: pd.Series, min_conditions: int = 6, is_volatile: bool = False) -> Dict[str, Any]:
+def generate_signal(row: pd.Series, min_conditions: int = 6, is_volatile: bool = False,
+                     tp_multiplier: float = 0.4, sl_multiplier: float = 3.0) -> Dict[str, Any]:
     """
     Pure technical signal — no AI. `min_conditions` out of 8 must agree.
     Skips entirely during Is_Volatile (chop tends to fake out every indicator
     at once regardless of how many conditions "agree").
+
+    tp_multiplier/sl_multiplier default to the live values (0.4x/3.0x ATR).
+    cli.py's backtest sweeps these to find the ratio that actually matches
+    this strategy's real win rate — a high-win-rate setup with a 0.4:3 payout
+    needs ~88%+ just to break even, so the ratio matters as much as the
+    condition threshold does.
     """
     result = evaluate_row(row)
     atr = row.get('ATR_14', 0.0)
@@ -185,12 +192,12 @@ def generate_signal(row: pd.Series, min_conditions: int = 6, is_volatile: bool =
 
     if result['bull_conditions'] >= min_conditions and result['bull_conditions'] > result['bear_conditions']:
         signal = 'BUY'
-        tp = close + (atr * 0.4)
-        sl = close - (atr * 3.0)
+        tp = close + (atr * tp_multiplier)
+        sl = close - (atr * sl_multiplier)
     elif result['bear_conditions'] >= min_conditions and result['bear_conditions'] > result['bull_conditions']:
         signal = 'SELL'
-        tp = close - (atr * 0.4)
-        sl = close + (atr * 3.0)
+        tp = close - (atr * tp_multiplier)
+        sl = close + (atr * sl_multiplier)
 
     return {
         **result,

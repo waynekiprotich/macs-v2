@@ -64,6 +64,33 @@ def test_all_bearish_conditions_fire_sell():
     assert sig['stop_loss'] > row['Close']
 
 
+def test_custom_tp_sl_multipliers_apply_to_both_buy_and_sell():
+    """Regression: a custom tp/sl_multiplier must actually change the computed
+    TP/SL on both the BUY and SELL branch — a first pass wired the SELL branch
+    to the hardcoded 0.4/3.0 defaults regardless of what was passed in, which
+    would have silently made a --tpsl-sweep report identical numbers for
+    every SELL-heavy backtest window no matter which multipliers were tested."""
+    buy_row = _base_row(
+        Regime='bullish', EMA_12=105.0, EMA_26=100.0, RSI_14=55.0,
+        Stoch_k=60.0, Stoch_d=50.0, MACD_diff=0.5,
+        Support=95.0, Support_Touches=3, Close=95.2,
+        BB_mid=90.0, BB_upper=110.0, Bullish_Candle=True, ATR_14=2.0,
+    )
+    sig = generate_signal(buy_row, min_conditions=6, is_volatile=False, tp_multiplier=1.5, sl_multiplier=1.0)
+    assert sig['take_profit'] == buy_row['Close'] + (2.0 * 1.5)
+    assert sig['stop_loss'] == buy_row['Close'] - (2.0 * 1.0)
+
+    sell_row = _base_row(
+        Regime='bearish', EMA_12=95.0, EMA_26=100.0, RSI_14=45.0,
+        Stoch_k=40.0, Stoch_d=50.0, MACD_diff=-0.5,
+        Resistance=105.0, Resistance_Touches=3, Close=104.8,
+        BB_mid=100.0, BB_lower=90.0, Bearish_Candle=True, ATR_14=2.0,
+    )
+    sig = generate_signal(sell_row, min_conditions=6, is_volatile=False, tp_multiplier=1.5, sl_multiplier=1.0)
+    assert sig['take_profit'] == sell_row['Close'] - (2.0 * 1.5)
+    assert sig['stop_loss'] == sell_row['Close'] + (2.0 * 1.0)
+
+
 def test_volatility_filter_forces_hold_even_with_strong_signal():
     row = _base_row(
         Regime='bullish', EMA_12=105.0, EMA_26=100.0, RSI_14=55.0,
