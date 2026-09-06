@@ -171,11 +171,14 @@ def generate_signal(row: pd.Series, min_conditions: int = 6, is_volatile: bool =
     Skips entirely during Is_Volatile (chop tends to fake out every indicator
     at once regardless of how many conditions "agree").
 
-    tp_multiplier/sl_multiplier default to the live values (0.4x/3.0x ATR).
-    cli.py's backtest sweeps these to find the ratio that actually matches
-    this strategy's real win rate — a high-win-rate setup with a 0.4:3 payout
-    needs ~88%+ just to break even, so the ratio matters as much as the
-    condition threshold does.
+    IMPORTANT: take_profit/stop_loss returned here are diagnostic/logging
+    only. The real contract execution/deriv_engine.py buys is a fixed
+    15-minute CALL (BUY) / PUT (SELL) binary option with NO barrier —
+    execute_signal() never reads take_profit or stop_loss at all. It settles
+    once, at expiry, purely on direction. Don't tune tp_multiplier/
+    sl_multiplier expecting it to change live behavior — it won't. The
+    actual lever on live performance is `min_conditions` (see cli.py's
+    `equity-backtest --sweep`, which models the real binary-option payoff).
     """
     result = evaluate_row(row)
     atr = row.get('ATR_14', 0.0)

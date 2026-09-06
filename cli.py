@@ -148,62 +148,54 @@ def _fetch_backtest_data(symbol: str, interval: str, period: str):
     return df, None
 
 
-def _simulate(df, min_conditions: int, tp_multiplier: float = 0.4, sl_multiplier: float = 3.0):
-    """Pure computation over already-fetched data — runs the SAME
-    technical_strategy used live, bar by bar, simulating a fixed-payout
-    Rise/Fall contract per signal (not a held equity position) so results
-    are actually representative of what MACS trades."""
+def _interval_to_minutes(interval: str) -> int:
+    unit = interval[-1]
+    n = int(interval[:-1])
+    return n * {"m": 1, "h": 60, "d": 1440}.get(unit, 1)
+
+
+def _simulate(df, min_conditions: int, payout_pct: float = 0.85, expiry_bars: int = 1):
+    """
+    Models the REAL contract MACS buys, confirmed against execution/deriv_engine.py:
+    a fixed-duration CALL (BUY) / PUT (SELL) binary option — duration=15,
+    duration_unit='m', no barrier of any kind. It settles exactly once, at
+    expiry, purely on direction:
+      - correct direction -> +payout_pct * stake
+      - wrong direction   -> -1.0 * stake (entire stake lost)
+
+    take_profit/stop_loss from technical_strategy.generate_signal() are NOT
+    used here and are not sent to Deriv by execute_signal() either — they're
+    diagnostic-only. An earlier version of this backtest simulated a TP/SL
+    barrier walk that doesn't correspond to any contract this system actually
+    buys; that model is gone. `expiry_bars` must equal how many bars of the
+    fetched interval make up the real 15-minute contract duration (1 bar at
+    interval=15m, which is why that's the required default).
+    """
     from core import technical_strategy
 
     trades = []
-    for i in range(210, len(df)):
+    for i in range(210, len(df) - expiry_bars):
         row = df.iloc[i]
         is_volatile = bool(row.get('Is_Volatile', False))
-        sig = technical_strategy.generate_signal(
-            row, min_conditions=min_conditions, is_volatile=is_volatile,
-            tp_multiplier=tp_multiplier, sl_multiplier=sl_multiplier,
-        )
+        sig = technical_strategy.generate_signal(row, min_conditions=min_conditions, is_volatile=is_volatile)
         if sig['signal'] not in ('BUY', 'SELL'):
             continue
 
         entry = row['Close']
-        tp, sl = sig['take_profit'], sig['stop_loss']
-        # Walk forward until TP/SL hit or a max holding window elapses
-        outcome = None
-        for j in range(i + 1, min(i + 40, len(df))):
-            future = df.iloc[j]
-            if sig['signal'] == 'BUY':
-                if future['High'] >= tp:
-                    outcome = ('TP', tp - entry)
-                    break
-                if future['Low'] <= sl:
-                    outcome = ('SL', sl - entry)
-                    break
-            else:
-                if future['Low'] <= tp:
-                    outcome = ('TP', entry - tp)
-                    break
-                if future['High'] >= sl:
-                    outcome = ('SL', entry - sl)
-                    break
-        if outcome is None:
-            continue  # neither hit within window — excluded, not counted either way
+        exit_price = df.iloc[i + expiry_bars]['Close']
+        won = (exit_price > entry) if sig['signal'] == 'BUY' else (exit_price < entry)
+        pnl = payout_pct if won else -1.0
         trades.append({
             "date": df.index[i], "signal": sig['signal'], "confidence": sig['confidence'],
-            "conditions": sig['reason'], "result": outcome[0], "pnl": outcome[1],
+            "conditions": sig['reason'], "result": "WIN" if won else "LOSS", "pnl": pnl,
         })
 
     return trades
 
 
-TP_GRID = [0.4, 0.8, 1.2, 1.6, 2.0]
-SL_GRID = [0.4, 0.8, 1.2, 1.6, 2.0, 3.0]
-BASELINE_TP, BASELINE_SL = 0.4, 3.0
-
-
 def _trade_stats(trades):
-    wins = [t for t in trades if t['result'] == 'TP']
-    losses = [t for t in trades if t['result'] == 'SL']
+    wins = [t for t in trades if t['result'] == 'WIN']
+    losses = [t for t in trades if t['result'] == 'LOSS']
     total = len(wins) + len(losses)
     win_rate = (len(wins) / total * 100) if total else 0.0
     total_pnl = sum(t['pnl'] for t in trades)
@@ -213,85 +205,56 @@ def _trade_stats(trades):
 @cli.command(name="equity-backtest")
 @click.option("--symbol", default="OTC_DJI", help="MACS symbol (OTC_DJI, frxXAUUSD) or raw yfinance ticker")
 @click.option("--days", default=59, help="Days of intraday history (yfinance caps 15m data at ~60d)")
-@click.option("--interval", default="15m", help="Bar interval — match your live granularity")
+@click.option("--interval", default="15m", help="Bar interval — MUST be 15m unless you also adjust the live contract duration; this is what the fixed-duration payout math is built around")
 @click.option("--min-conditions", default=None, type=int, help="Override MACS_MIN_CONDITIONS for this run")
+@click.option("--payout", default=0.85, type=float, help="Assumed Deriv payout ratio for a correct call (e.g. 0.85 = 85%% return on win). Check the real proposal payout in your Deriv app/logs — it varies by symbol and market conditions and isn't something this strategy controls.")
 @click.option("--sweep", is_flag=True, help="Test every condition threshold 4-8 to find the best min_conditions")
-@click.option("--tpsl-sweep", is_flag=True, help="Test a grid of TP/SL multipliers (at the chosen min-conditions) to find the best payout ratio")
-def backtest(symbol, days, interval, min_conditions, sweep, tpsl_sweep):
-    """Backtest the SAME technical_strategy that trades live (pure technical, no AI)."""
+def backtest(symbol, days, interval, min_conditions, payout, sweep):
+    """Backtest the fixed-duration CALL/PUT binary contract MACS actually buys (pure technical, no AI, no TP/SL — there is none in this product)."""
     from config.settings import settings
 
     fixed_threshold = min_conditions or settings.MACS_MIN_CONDITIONS
+    expiry_bars = max(1, round(15 / _interval_to_minutes(interval)))
+    breakeven = 1 / (1 + payout) * 100
+
     console.print(f"[bold cyan]MACS Backtest[/] — {symbol} ({days}d @ {interval}) — proxy: {SYMBOL_PROXY.get(symbol, symbol)}")
-    console.print("[dim]Simulates fixed-payout Rise/Fall style exits (first TP/SL hit within 40 bars).[/dim]")
+    console.print(f"[dim]Fixed 15-min CALL/PUT binary, settled purely on direction at expiry. Assumed payout: {payout*100:.0f}% "
+                  f"(breakeven win rate: {breakeven:.1f}%). Real payout varies — check your Deriv proposal logs.[/dim]")
+    if interval != "15m":
+        console.print(f"[yellow]Warning: --interval {interval} means {expiry_bars} bar(s) approximate a 15-min expiry — for an exact match use --interval 15m.[/]")
 
     df, err = _fetch_backtest_data(symbol, interval, f"{days}d")
     if err:
         console.print(f"[red]{err}[/]")
         return
 
-    if sweep:
-        summary = Table(title=f"Condition Threshold Sweep — {symbol} (TP={BASELINE_TP}x/SL={BASELINE_SL}x ATR)")
-        summary.add_column("Min Conditions", style="cyan")
-        summary.add_column("Trades", style="bold")
-        summary.add_column("Wins")
-        summary.add_column("Losses")
-        summary.add_column("Win Rate")
-        summary.add_column("Total P&L")
+    thresholds = range(4, 9) if sweep else [fixed_threshold]
 
-        for threshold in range(4, 9):
-            trades = _simulate(df, threshold, BASELINE_TP, BASELINE_SL)
-            wins, losses, total, win_rate, total_pnl = _trade_stats(trades)
-            win_style = "green" if win_rate >= 55 else "red" if total else "yellow"
-            pnl_style = "green" if total_pnl > 0 else "red"
-            summary.add_row(
-                str(threshold), str(total), str(len(wins)), str(len(losses)),
-                f"[{win_style}]{win_rate:.1f}%[/]",
-                f"[{pnl_style}]{total_pnl:.2f}[/]",
-            )
-        console.print(summary)
-        console.print("[dim]Tune MACS_MIN_CONDITIONS in .env to the threshold with the best win-rate/trade-count tradeoff.[/dim]")
+    summary = Table(title=f"Backtest Results — {symbol} (fixed 15-min CALL/PUT, {payout*100:.0f}% payout)")
+    summary.add_column("Min Conditions", style="cyan")
+    summary.add_column("Trades", style="bold")
+    summary.add_column("Wins")
+    summary.add_column("Losses")
+    summary.add_column("Win Rate")
+    summary.add_column("Total P&L (stakes)")
+    summary.add_column("Expectancy/Trade")
 
-    if tpsl_sweep:
-        results = []
-        for tp in TP_GRID:
-            for sl in SL_GRID:
-                trades = _simulate(df, fixed_threshold, tp, sl)
-                wins, losses, total, win_rate, total_pnl = _trade_stats(trades)
-                expectancy = (total_pnl / total) if total else 0.0
-                results.append((tp, sl, total, len(wins), len(losses), win_rate, total_pnl, expectancy))
-
-        # Always show the current live baseline, then the best-by-total-P&L combos.
-        baseline = next((r for r in results if r[0] == BASELINE_TP and r[1] == BASELINE_SL), None)
-        ranked = sorted(results, key=lambda r: r[6], reverse=True)
-
-        grid = Table(title=f"TP/SL Multiplier Sweep — {symbol} (fixed at {fixed_threshold}/8 conditions)")
-        grid.add_column("TP (xATR)", style="cyan")
-        grid.add_column("SL (xATR)", style="cyan")
-        grid.add_column("Ratio TP:SL")
-        grid.add_column("Trades")
-        grid.add_column("Win Rate")
-        grid.add_column("Total P&L")
-        grid.add_column("Exp/Trade")
-
-        def _add_row(r, tag=""):
-            tp, sl, total, w, l, win_rate, total_pnl, expectancy = r
-            pnl_style = "green" if total_pnl > 0 else "red" if total else "yellow"
-            grid.add_row(
-                f"{tp:.1f}{tag}", f"{sl:.1f}", f"1:{sl/tp:.1f}", str(total),
-                f"{win_rate:.1f}%", f"[{pnl_style}]{total_pnl:.2f}[/]", f"{expectancy:.4f}",
-            )
-
-        if baseline:
-            _add_row(baseline, tag=" (current live)")
-        for r in ranked[:10]:
-            if baseline and r[0] == baseline[0] and r[1] == baseline[1]:
-                continue
-            _add_row(r)
-
-        console.print(grid)
-        console.print(f"[dim]Fixed at {fixed_threshold}/8 conditions (pass --min-conditions to test a different threshold). "
-                       f"Ranked by total P&L, current live baseline (0.4/3.0) always shown first for comparison.[/dim]")
+    for threshold in thresholds:
+        trades = _simulate(df, threshold, payout, expiry_bars)
+        wins, losses, total, win_rate, total_pnl = _trade_stats(trades)
+        expectancy = (total_pnl / total) if total else 0.0
+        win_style = "green" if win_rate >= breakeven else "red" if total else "yellow"
+        pnl_style = "green" if total_pnl > 0 else "red"
+        summary.add_row(
+            str(threshold), str(total), str(len(wins)), str(len(losses)),
+            f"[{win_style}]{win_rate:.1f}%[/]",
+            f"[{pnl_style}]{total_pnl:.2f}[/]",
+            f"{expectancy:.4f}",
+        )
+    console.print(summary)
+    console.print(f"[dim]P&L is in units of stake (1.0 = one full stake). Win rate must clear {breakeven:.1f}% to be "
+                  f"profitable at this payout — that's the real bar, not 50%. Tune MACS_MIN_CONDITIONS in .env to "
+                  f"the threshold with the best win-rate/trade-count tradeoff above that line.[/dim]")
 
 
 @cli.command()
