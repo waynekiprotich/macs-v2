@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     # `python cli.py backtest` — this is the single biggest lever on win rate
     # vs. trade frequency.
     MACS_MIN_CONDITIONS: int = 6
+    # Contract duration sent to Deriv. This was hardcoded to 15m in
+    # deriv_engine._execute_contract(); it lives here so the alert can report
+    # the same number the contract actually used instead of a duplicated
+    # literal. Changing it invalidates the backtest math in cli.py, which
+    # assumes one 15m bar == one contract — re-run --duration-sweep first.
+    MACS_CONTRACT_DURATION: int = 15
+    MACS_CONTRACT_DURATION_UNIT: str = "m"
     DATABASE_URL: str = "sqlite:///macs.db"
     DISCORD_WEBHOOK_URL: str = ""
 
