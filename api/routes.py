@@ -48,7 +48,7 @@ def get_risk(symbol: str = "ALL"):
             risk_level="BLOCKED" if not status['allowed'] else (
                 "ELEVATED" if rm.consecutive_losses else "NORMAL"
             ),
-            max_position_size=10.0,  # matches the hardcoded stake in pipeline.execute_trade
+            max_position_size=170.0,  # matches the hardcoded stake in pipeline.execute_trade
             warnings=warnings,
         )
     except Exception as e:
