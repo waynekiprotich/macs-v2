@@ -119,7 +119,7 @@ class TradingPipeline:
         res = engine.execute_signal(
             symbol=symbol,
             signal=action,
-            quantity=10.0, # Stake $10
+            quantity=170.0, # Stake $170
             price=data_row.get('Close', 0.0),
             reason=reason,
             tech_score=confidence,
