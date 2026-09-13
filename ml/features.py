@@ -212,6 +212,51 @@ def build_dataset(session, since: Optional[datetime] = None, symbol: Optional[st
     return pd.DataFrame(rows, columns=META_COLUMNS + FEATURE_COLUMNS)
 
 
+def build_snapshot_dataset(session, since: Optional[datetime] = None, symbol: Optional[str] = None) -> pd.DataFrame:
+    """One labelled row per stored bar, replaying technical_strategy over
+    market_snapshots: side = the direction more conditions agree with (ties
+    skipped), entry = the bar's close, exit = the close one contract duration
+    later (label_source "snapshot").
+
+    Covers every bar rather than only those that cleared the live threshold,
+    so a model has rows to learn from while signals accumulate. Entry on a
+    closed bar matches cli.py's backtest, not the live still-forming bar."""
+    query = session.query(MarketSnapshot).filter(MarketSnapshot.indicators.isnot(None))
+    if since:
+        query = query.filter(MarketSnapshot.candle_time >= since)
+    if symbol:
+        query = query.filter(MarketSnapshot.symbol == symbol)
+    snapshots = query.order_by(MarketSnapshot.candle_time, MarketSnapshot.symbol).all()
+
+    closes = {(s.symbol, s.granularity, _utc(s.candle_time)): s.close for s in snapshots}
+    duration = _duration_delta(settings.MACS_CONTRACT_DURATION, settings.MACS_CONTRACT_DURATION_UNIT)
+
+    rows = []
+    for snap in snapshots:
+        candle_time = _utc(snap.candle_time)
+        conditions = technical_strategy.evaluate_row(pd.Series(snap.indicators))
+        bull, bear = conditions["bull_conditions"], conditions["bear_conditions"]
+        if bull == bear:
+            continue
+        side = "BUY" if bull > bear else "SELL"
+        won = label_from_prices(side, snap.close, closes.get((snap.symbol, snap.granularity, candle_time + duration)))
+        if won is None:
+            continue
+        rows.append({
+            "signal_id": None,
+            "trade_id": None,
+            "symbol": snap.symbol,
+            "candle_time": candle_time,
+            "signal": side,
+            "action_taken": None,
+            "label_source": "snapshot",
+            "payout_ratio": None,
+            "won": won,
+            **compute_features(snap.indicators, side, candle_time),
+        })
+    return pd.DataFrame(rows, columns=META_COLUMNS + FEATURE_COLUMNS)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Export labelled ML feature rows from the signals table.")
     parser.add_argument("--out", default="features.csv")

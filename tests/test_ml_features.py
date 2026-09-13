@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ml.features import FEATURE_COLUMNS, build_dataset, compute_features, label_from_prices
+from ml.features import FEATURE_COLUMNS, build_dataset, build_snapshot_dataset, compute_features, label_from_prices
 from models.database import MarketSnapshot, PaperTrade, SessionLocal, SystemLog, init_db
 
 T0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
@@ -95,3 +95,22 @@ def test_build_dataset_keeps_one_row_per_bar_preferring_the_traded_signal():
 
     assert list(df["signal_id"]) == [traded_id]
     assert list(df["label_source"]) == ["trade"]
+
+
+def test_snapshot_dataset_replays_the_rule_on_every_bar_with_an_exit():
+    init_db()
+    db = SessionLocal()
+    try:
+        # IND agrees with 7 bull conditions and 0 bear, so every bar replays as a BUY.
+        for minutes, close in ((0, 100.0), (15, 101.0), (30, 100.5)):
+            db.add(MarketSnapshot(symbol="TEST_SNAP", granularity=900, candle_time=T0 + timedelta(minutes=minutes),
+                                  open=close, high=close, low=close, close=close, source="test", indicators=IND))
+        db.commit()
+
+        df = build_snapshot_dataset(db, symbol="TEST_SNAP")
+    finally:
+        db.close()
+
+    assert list(df["signal"]) == ["BUY", "BUY"]
+    assert list(df["won"]) == [1, 0]  # the last bar has no exit bar yet
+    assert set(df["label_source"]) == {"snapshot"}

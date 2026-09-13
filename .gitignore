@@ -8,6 +8,7 @@ __pycache__/
 macs.db
 *.bak
 features.csv
+ml/artifacts/
 venv/
 .pytest_cache/
 .heartbeat_state.json
