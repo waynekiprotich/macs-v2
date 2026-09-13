@@ -59,6 +59,12 @@ def _per(a: float, b: float) -> float:
     return a / b if b else math.nan
 
 
+def _indicator_row(ind: Mapping[str, Any]) -> pd.Series:
+    """Stored indicators hold null where the live row held NaN (JSONB has no
+    NaN). technical_strategy compares with NaN safely but not with None."""
+    return pd.Series({key: math.nan if value is None else value for key, value in ind.items()})
+
+
 def compute_features(ind: Mapping[str, Any], side: str, candle_time: datetime) -> Dict[str, float]:
     """Model inputs for taking `side` ("BUY"/"SELL") on the bar described by
     `ind`: one row from compute_indicators -> detect_regime ->
@@ -78,7 +84,7 @@ def compute_features(ind: Mapping[str, Any], side: str, candle_time: datetime) -
     stoch_k = _num(ind, "Stoch_k")
     bb_position = _per(close - bb_lower, bb_upper - bb_lower)
 
-    conditions = technical_strategy.evaluate_row(pd.Series(dict(ind)))
+    conditions = technical_strategy.evaluate_row(_indicator_row(ind))
     bull, bear = conditions["bull_conditions"], conditions["bear_conditions"]
     regime = ind.get("Regime")
     hour = candle_time.hour + candle_time.minute / 60
@@ -234,7 +240,7 @@ def build_snapshot_dataset(session, since: Optional[datetime] = None, symbol: Op
     rows = []
     for snap in snapshots:
         candle_time = _utc(snap.candle_time)
-        conditions = technical_strategy.evaluate_row(pd.Series(snap.indicators))
+        conditions = technical_strategy.evaluate_row(_indicator_row(snap.indicators))
         bull, bear = conditions["bull_conditions"], conditions["bear_conditions"]
         if bull == bear:
             continue

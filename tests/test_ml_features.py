@@ -36,6 +36,12 @@ def test_zero_atr_gives_nan_instead_of_crashing():
     assert math.isnan(compute_features({**IND, "ATR_14": 0.0}, "BUY", T0)["trend_ema"])
 
 
+def test_null_from_stored_json_is_treated_as_missing():
+    # JSONB stores the live row's NaN (e.g. Support during its warm-up window) as null.
+    features = compute_features({**IND, "Support": None, "Support_Touches": None}, "BUY", T0)
+    assert math.isnan(features["dist_backstop"])
+
+
 def test_price_tie_loses():
     assert label_from_prices("BUY", 100.0, 100.0) == 0
     assert label_from_prices("SELL", 100.0, 100.0) == 0
