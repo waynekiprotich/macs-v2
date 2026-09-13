@@ -6,6 +6,8 @@ __pycache__/
 *.err
 *.orig
 macs.db
+*.bak
+features.csv
 venv/
 .pytest_cache/
 .heartbeat_state.json
