@@ -168,9 +168,18 @@ def build_dataset(session, since: Optional[datetime] = None, symbol: Optional[st
     closes = {(sym, granularity, _utc(ct)): close for sym, granularity, ct, close in snapshots}
     duration = _duration_delta(settings.MACS_CONTRACT_DURATION, settings.MACS_CONTRACT_DURATION_UNIT)
 
-    rows, dropped = [], 0
-    for sig, trade in signals.order_by(SystemLog.candle_time).all():
+    rows, dropped, duplicates, seen = [], 0, 0, set()
+    # While a market is closed the pipeline re-evaluates the same bar every
+    # cycle. Keep one row per bar, preferring the signal a trade was placed on.
+    ordered = signals.order_by(SystemLog.candle_time, PaperTrade.id.is_(None), SystemLog.id)
+    for sig, trade in ordered.all():
         candle_time = _utc(sig.candle_time)
+        bar = (sig.symbol, sig.granularity, candle_time)
+        if bar in seen:
+            duplicates += 1
+            continue
+        seen.add(bar)
+
         won, source = (label_from_trade(trade), "trade") if trade else (None, None)
         if won is None:
             exit_close = closes.get((sig.symbol, sig.granularity, candle_time + duration))
@@ -196,6 +205,8 @@ def build_dataset(session, since: Optional[datetime] = None, symbol: Optional[st
             **compute_features(sig.indicators, sig.signal, candle_time),
         })
 
+    if duplicates:
+        logger.info(f"Skipped {duplicates} repeat evaluation(s) of a bar already in the dataset.")
     if dropped:
         logger.info(f"Dropped {dropped} signal(s) with no settled trade and no exit candle to label them.")
     return pd.DataFrame(rows, columns=META_COLUMNS + FEATURE_COLUMNS)

@@ -70,3 +70,28 @@ def test_build_dataset_labels_from_trade_then_candles():
     assert list(df["label_source"]) == ["trade", "candle"]
     assert list(df["won"]) == [0, 1]
     assert df["payout_ratio"].iloc[0] == pytest.approx(0.85)
+
+
+def test_build_dataset_keeps_one_row_per_bar_preferring_the_traded_signal():
+    init_db()
+    db = SessionLocal()
+    try:
+        bar = T0 + timedelta(days=1)
+        repeats = [
+            SystemLog(symbol="TEST_DUP", signal="BUY", candle_time=bar, granularity=900,
+                      close_price=101.0, indicators=IND, action_taken=action)
+            for action in ("RISK_BLOCKED", "EXECUTED", "RISK_BLOCKED")
+        ]
+        db.add_all(repeats)
+        db.flush()
+        traded_id = repeats[1].id
+        db.add(PaperTrade(symbol="TEST_DUP", side="BUY", quantity=170.0, price=170.0, status="CLOSED",
+                          result="WON", pnl=136.0, signal_id=traded_id))
+        db.commit()
+
+        df = build_dataset(db, symbol="TEST_DUP")
+    finally:
+        db.close()
+
+    assert list(df["signal_id"]) == [traded_id]
+    assert list(df["label_source"]) == ["trade"]
