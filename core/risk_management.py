@@ -4,7 +4,7 @@ from typing import Dict, Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models.database import SessionLocal, PaperTrade
+from models.database import SessionLocal, PaperTrade, RiskEvent
 
 logger = logging.getLogger(__name__)
 
@@ -14,32 +14,32 @@ class RiskManager:
         self.max_daily_loss = -500.0
         self.cooldown_hours = 4
         self.consecutive_loss_limit = 3
-        
+
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self.cooldown_until = None
-        
+
         self._load_state()
 
     def _load_state(self):
-        """Read state from SQLite DB PaperTrade table on init to survive restarts."""
+        """Read state from the trades table on init to survive restarts."""
         db: Session = SessionLocal()
         try:
             today = datetime.datetime.now(datetime.timezone.utc).date()
             today_start = datetime.datetime.combine(today, datetime.time.min, tzinfo=datetime.timezone.utc)
-            
+
             # Daily PNL
             result = db.query(func.sum(PaperTrade.pnl)).filter(
                 PaperTrade.timestamp >= today_start,
                 PaperTrade.status == 'CLOSED'
             ).scalar()
             self.daily_pnl = result if result else 0.0
-            
+
             # Consecutive losses
             recent_trades = db.query(PaperTrade).filter(
                 PaperTrade.status == 'CLOSED'
             ).order_by(PaperTrade.timestamp.desc()).limit(self.consecutive_loss_limit).all()
-            
+
             losses = 0
             latest_loss_time = None
             for trade in recent_trades:
@@ -49,15 +49,15 @@ class RiskManager:
                         latest_loss_time = trade.timestamp
                 else:
                     break
-                    
+
             self.consecutive_losses = losses
-            
+
             if self.consecutive_losses >= self.consecutive_loss_limit and latest_loss_time:
                 # Ensure latest_loss_time is timezone-aware
                 if latest_loss_time.tzinfo is None:
                     latest_loss_time = latest_loss_time.replace(tzinfo=datetime.timezone.utc)
                 self.cooldown_until = latest_loss_time + datetime.timedelta(hours=self.cooldown_hours)
-                
+
             logger.info(f"Risk state loaded via SQLAlchemy. Daily PnL: {self.daily_pnl}, Consecutive Losses: {self.consecutive_losses}")
         except Exception as e:
             logger.error(f"Error loading state from DB: {e}")
@@ -67,25 +67,65 @@ class RiskManager:
     def can_trade(self) -> Dict[str, Any]:
         """Check if trading is allowed based on risk parameters."""
         now = datetime.datetime.now(datetime.timezone.utc)
-        
+
         if self.cooldown_until:
             if now < self.cooldown_until:
                 return {
                     "allowed": False,
                     "reason": f"Circuit breaker active until {self.cooldown_until.isoformat()}"
                 }
-            
+
         if self.daily_pnl <= self.max_daily_loss:
             return {
                 "allowed": False,
                 "reason": f"Max daily loss exceeded: {self.daily_pnl}"
             }
-            
+
         return {
             "allowed": True,
             "reason": "Risk checks passed"
         }
-        
+
+    def record_block(self) -> None:
+        """Write a risk_events row when a block starts, not on every cycle it
+        stays in force: once per cooldown for the circuit breaker, once per
+        UTC day for the daily loss limit."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if self.cooldown_until and now < self.cooldown_until:
+            event_type = "CIRCUIT_BREAKER"
+            since = self.cooldown_until - datetime.timedelta(hours=self.cooldown_hours)
+            threshold, observed = self.consecutive_loss_limit, self.consecutive_losses
+        elif self.daily_pnl <= self.max_daily_loss:
+            event_type = "DAILY_LOSS_LIMIT"
+            since = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=datetime.timezone.utc)
+            threshold, observed = self.max_daily_loss, self.daily_pnl
+        else:
+            return
+
+        db: Session = SessionLocal()
+        try:
+            already_recorded = db.query(RiskEvent.id).filter(
+                RiskEvent.event_type == event_type, RiskEvent.timestamp >= since
+            ).first()
+            if already_recorded:
+                return
+            db.add(RiskEvent(
+                event_type=event_type,
+                severity="CRITICAL",
+                daily_pnl=self.daily_pnl,
+                consecutive_losses=self.consecutive_losses,
+                cooldown_until=self.cooldown_until,
+                threshold=float(threshold),
+                observed=float(observed),
+                message=self.can_trade()["reason"],
+            ))
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to record risk event: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
     def update_trade_result(self, pnl: float):
         """Update risk state after a trade closes."""
         self.daily_pnl += pnl

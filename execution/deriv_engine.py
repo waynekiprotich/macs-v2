@@ -27,6 +27,14 @@ def _duration_delta(amount: int, unit: str) -> timedelta:
         return timedelta(seconds=amount * 2)
     return timedelta(minutes=amount)
 
+
+def _float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class DerivEngine(BaseEngine):
     def __init__(self):
         super().__init__()
@@ -40,12 +48,12 @@ class DerivEngine(BaseEngine):
             'Deriv-App-ID': self.app_id,
             'Content-Type': 'application/json'
         }
-        
+
         # 1. Fetch OTP
         resp = requests.post(f'https://api.derivws.com/trading/v1/options/accounts/{self.account_id}/otp', headers=headers)
         resp.raise_for_status()
         ws_url = resp.json()['data']['url']
-        
+
         async with websockets.connect(ws_url) as ws:
             contract_type = "CALL" if signal.upper() == "BUY" else "PUT"
             duration = settings.MACS_CONTRACT_DURATION
@@ -82,11 +90,11 @@ class DerivEngine(BaseEngine):
             }
             await ws.send(json.dumps(buy_req))
             buy_response = json.loads(await ws.recv())
-            
+
             if 'error' in buy_response:
                 logger.error(f"Deriv Buy Error: {buy_response['error']}")
                 return None
-                
+
             buy = buy_response['buy']
             contract_id = buy['contract_id']
             buy_price = buy['buy_price']
@@ -128,21 +136,22 @@ class DerivEngine(BaseEngine):
             }
 
     def execute_signal(self, symbol: str, signal: str, quantity: float, price: float, reason: str = "",
-                       tech_score: float = None, ai_score: float = None, confidence: float = None, regime: str = None) -> dict:
+                       tech_score: float = None, ai_score: float = None, confidence: float = None, regime: str = None,
+                       signal_id: int = None) -> dict:
         """
         Synchronous wrapper to execute a contract and log it.
         """
         if signal.upper() not in ('BUY', 'SELL'):
             return {"status": "ignored"}
-            
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         result = loop.run_until_complete(self._execute_contract(symbol, signal, quantity))
         loop.close()
-        
+
         if not result:
             return {"status": "error", "message": "Failed to purchase Deriv contract"}
-            
+
         # Log to DB
         db = SessionLocal()
         try:
@@ -155,20 +164,30 @@ class DerivEngine(BaseEngine):
                 reason=reason,
                 contract_id=str(result['contract_id']),
                 proposal_id=str(result.get('proposal_id', '')),
-                payout=float(result['payout']) if result.get('payout') is not None else None,
+                payout=_float_or_none(result.get('payout')),
                 tech_score=tech_score,
                 ai_score=ai_score,
                 confidence=confidence,
-                regime=regime
+                regime=regime,
+                signal_id=signal_id,
+                broker="deriv",
+                mode=settings.MACS_MODE,
+                contract_type=result.get('contract_type'),
+                duration=result.get('duration'),
+                duration_unit=result.get('duration_unit'),
+                entry_time=result.get('entry_time'),
+                expiry_time=result.get('expiry_time'),
+                entry_spot=_float_or_none(result.get('entry_spot')),
+                quoted_payout=_float_or_none(result.get('payout')),
             )
             db.add(trade)
             db.commit()
             db.refresh(trade)
-            
+
             t_score = tech_score if tech_score is not None else 0.0
             c_score = confidence if confidence is not None else 0.0
             r_str = regime if regime is not None else "unknown"
-            
+
             # Send Discord Alert
             send_discord_signal(
                 symbol=symbol,
@@ -189,7 +208,7 @@ class DerivEngine(BaseEngine):
                     "longcode": result.get('longcode'),
                 },
             )
-            
+
             return {"status": "success", "trade_id": trade.id, "contract_id": result['contract_id']}
         except Exception as e:
             logger.error(f"Failed to log Deriv trade: {e}")
@@ -220,9 +239,9 @@ class DerivEngine(BaseEngine):
             open_trades = db.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
             if not open_trades:
                 return
-                
+
             logger.info(f"Reconciling {len(open_trades)} OPEN contracts...")
-            
+
             headers = {
                 'Authorization': f'Bearer {self.token}',
                 'Deriv-App-ID': self.app_id,
@@ -232,9 +251,9 @@ class DerivEngine(BaseEngine):
             if resp.status_code != 200:
                 logger.error("Reconciliation failed to get OTP.")
                 return
-                
+
             ws_url = resp.json()['data']['url']
-            
+
             async def run_recon():
                 async with websockets.connect(ws_url) as ws:
                     from datetime import datetime, timezone
@@ -244,7 +263,7 @@ class DerivEngine(BaseEngine):
                         contract_info = await self._reconcile_contract(ws, trade.contract_id)
                         if not contract_info:
                             continue
-                            
+
                         # is_sold == 1 or status in ('won', 'lost') means it's closed
                         if contract_info.get('is_sold') == 1 or contract_info.get('status') in ('won', 'lost'):
                             status_str = contract_info.get('status', 'unknown')
@@ -252,14 +271,18 @@ class DerivEngine(BaseEngine):
                             trade.result = status_str.upper()
                             trade.payout = float(contract_info.get('sell_price', 0) or contract_info.get('payout', 0))
                             trade.pnl = float(contract_info.get('profit', 0))
+                            trade.sell_price = _float_or_none(contract_info.get('sell_price'))
+                            trade.exit_spot = _float_or_none(contract_info.get('exit_tick') or contract_info.get('sell_spot'))
+                            if trade.entry_spot is None:
+                                trade.entry_spot = _float_or_none(contract_info.get('entry_spot'))
                             trade.closed_timestamp = datetime.now(timezone.utc)
                             logger.info(f"Reconciled contract {trade.contract_id}: {trade.result} | PnL: {trade.pnl}")
-            
+
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(run_recon())
             loop.close()
-            
+
             db.commit()
         except Exception as e:
             logger.error(f"Reconciliation error: {e}")
