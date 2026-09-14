@@ -3,12 +3,21 @@ Real performance metrics from actual trades — not a backtest, not a guess.
 This is the thing the old system never had: proof of your actual win rate.
 """
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from sqlalchemy import func
 
 from models.database import SessionLocal, PaperTrade
 
 logger = logging.getLogger(__name__)
+
+
+def _quoted_payout(trade: PaperTrade) -> Optional[float]:
+    """Deriv's payout quote for this trade. quoted_payout is the untouched
+    quote; older rows only have `payout`, which reconcile rewrites to 0 on a
+    loss, so there only a positive value is a quote."""
+    if trade.quoted_payout is not None:
+        return trade.quoted_payout
+    return trade.payout if trade.payout else None
 
 
 def compute_metrics(symbol: str = None) -> Dict[str, Any]:
@@ -63,9 +72,9 @@ def compute_metrics(symbol: str = None) -> Dict[str, Any]:
         # accuracy. Compare it against whatever --payout you assumed in the
         # backtest — if the real ratio is worse, the backtest was optimistic.
         payout_ratios = [
-            (t.payout - t.price) / t.price
+            (quote - t.price) / t.price
             for t in trades
-            if t.payout is not None and t.price
+            if t.price and (quote := _quoted_payout(t)) is not None
         ]
         avg_payout_ratio = (sum(payout_ratios) / len(payout_ratios)) if payout_ratios else None
         breakeven_win_rate = (100 / (1 + avg_payout_ratio)) if avg_payout_ratio else None

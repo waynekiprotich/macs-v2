@@ -60,7 +60,7 @@ Reading these honestly matters more than running them:
 - **`--slices` generates hypotheses, not results.** Run on synthetic random data with no edge by construction, it still surfaces hours at ~62% win rate. Cutting data 20 ways guarantees a winner by luck. Anything it finds must survive `--walk-forward` on data it wasn't discovered in.
 - **Breakeven is `1/(1+payout)`**, ~54.1% at an 85% payout — not 50%. `python cli.py performance` now reports your *real* payout ratio from Deriv's own quotes and whether live results clear it.
 
-`.env` needs `DERIV_API_TOKEN`, `DERIV_APP_ID` (demo account only — hardcoded in `data_deriv.py`), and `DATABASE_URL=sqlite:///macs.db`.
+`.env` needs `DERIV_API_TOKEN`, `DERIV_APP_ID` (demo account only — hardcoded in `data_deriv.py`), and `DATABASE_URL` — `sqlite:///macs.db` locally, or a Supabase Session pooler URL (see `config/settings.py`). Create or upgrade the schema with `alembic upgrade head` before pointing the app at a database.
 
 **Never hardcode credentials in scripts.** A live API token was once committed here in two scratch files and pushed to GitHub, bypassing the gitignored `.env` entirely. There's a guard against a repeat:
 ```bash
