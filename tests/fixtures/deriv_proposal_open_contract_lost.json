@@ -1,0 +1,125 @@
+{
+  "echo_req": {
+    "contract_id": 13070559979,
+    "proposal_open_contract": 1,
+    "req_id": 102
+  },
+  "msg_type": "proposal_open_contract",
+  "proposal_open_contract": {
+    "account_id": 10000001,
+    "audit_details": {
+      "contract_end": [
+        {
+          "epoch": 1789488708,
+          "tick": 4289.56,
+          "tick_display_value": "4289.56"
+        },
+        {
+          "epoch": 1789488709,
+          "tick": 4289.44,
+          "tick_display_value": "4289.44"
+        },
+        {
+          "epoch": 1789488710,
+          "flag": "highlight_tick",
+          "name": "End Time and Exit Spot",
+          "tick": 4289.36,
+          "tick_display_value": "4289.36"
+        },
+        {
+          "epoch": 1789488711,
+          "tick": 4289.43,
+          "tick_display_value": "4289.43"
+        },
+        {
+          "epoch": 1789488712,
+          "tick": 4289.37,
+          "tick_display_value": "4289.37"
+        },
+        {
+          "epoch": 1789488713,
+          "tick": 4289.48,
+          "tick_display_value": "4289.48"
+        }
+      ],
+      "contract_start": [
+        {
+          "epoch": 1789487808,
+          "tick": 4292.03,
+          "tick_display_value": "4292.03"
+        },
+        {
+          "epoch": 1789487809,
+          "tick": 4292.06,
+          "tick_display_value": "4292.06"
+        },
+        {
+          "epoch": 1789487810,
+          "flag": "highlight_time",
+          "name": "Start Time",
+          "tick": 4292.14,
+          "tick_display_value": "4292.14"
+        },
+        {
+          "epoch": 1789487811,
+          "flag": "highlight_tick",
+          "name": "Entry Spot",
+          "tick": 4291.95,
+          "tick_display_value": "4291.95"
+        },
+        {
+          "epoch": 1789487812,
+          "tick": 4291.96,
+          "tick_display_value": "4291.96"
+        },
+        {
+          "epoch": 1789487813,
+          "tick": 4292.0,
+          "tick_display_value": "4292.00"
+        }
+      ]
+    },
+    "barrier": "4291.95",
+    "barrier_count": 1,
+    "bid_price": "0.00",
+    "buy_price": "170.00",
+    "contract_id": 13070559979,
+    "contract_type": "CALL",
+    "currency": "USD",
+    "current_spot": "4294.12",
+    "current_spot_time": 1789491759,
+    "date_expiry": 1789488710,
+    "date_settlement": 1789488710,
+    "date_start": 1789487810,
+    "entry_spot": "4291.95",
+    "entry_spot_time": 1789487811,
+    "exit_spot": "4289.36",
+    "exit_spot_time": 1789488710,
+    "expiry_time": 1789488710,
+    "is_expired": 1,
+    "is_intraday": 1,
+    "is_path_dependent": 0,
+    "is_settleable": 1,
+    "is_sold": 1,
+    "is_valid_to_cancel": 0,
+    "is_valid_to_sell": 0,
+    "longcode": "Win payout if Gold/USD is strictly higher than entry spot at 15 minutes after contract start time.",
+    "payout": "295.76",
+    "profit": "-170.00",
+    "profit_percentage": -100,
+    "purchase_time": 1789487810,
+    "sell_price": "0.00",
+    "sell_time": 1789488711,
+    "shortcode": "CALL_FRXXAUUSD_295.76_1789487810_1789488710_S0P_0",
+    "status": "lost",
+    "transaction_ids": {
+      "buy": 90000000003,
+      "sell": 90000000004
+    },
+    "underlying_symbol": "frxXAUUSD",
+    "validation_error": "This contract has been sold.",
+    "validation_error_code": "ContractAlreadySold",
+    "validation_error_code_args": null
+  },
+  "req_id": 102
+}

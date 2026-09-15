@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -17,12 +17,34 @@ from execution.deriv_engine import DerivEngine
 from models.database import PaperTrade, SessionLocal, TradeIntent
 
 CANDLE = datetime(2026, 9, 15, 11, 0, tzinfo=timezone.utc)
-BUY_OK = {"buy": {"contract_id": 555001, "buy_price": 170.0}}
+RECEIPT = {"contract_id": 555001, "buy_price": 170.0}
+
+
+def buy_reply(receipt=RECEIPT, **overrides):
+    """Deriv's reply to a buy, identified the way the Options API identifies
+    it: the request's req_id, msg_type buy, and the request echoed back."""
+    def reply(request):
+        return {"echo_req": request, "msg_type": "buy", "req_id": request["req_id"], "buy": receipt, **overrides}
+    return reply
+
+
+def refusal(**overrides):
+    def reply(request):
+        return {"echo_req": request, "msg_type": "buy", "req_id": request["req_id"],
+                "error": {"code": "InvalidPrice", "message": "Price moved"}, **overrides}
+    return reply
+
+
+BUY_OK = buy_reply()
+
+
+class ProcessKilled(BaseException):
+    """The process stopping mid-buy (SIGKILL, container stop): nothing catches it."""
 
 
 class FakeDeriv:
-    """Deriv's websocket: records every request, answers the proposal, and
-    answers the buy with a reply dict, or hangs when buy_reply is "hang"."""
+    """Deriv's websocket: records every request and answers the proposal. The
+    buy is answered by buy_reply(request), a raw dict, or never ("hang")."""
 
     def __init__(self, buy_reply):
         self.buy_reply = buy_reply
@@ -38,11 +60,14 @@ class FakeDeriv:
         self.sent.append(json.loads(data))
 
     async def recv(self):
-        if "proposal" in self.sent[-1]:
-            return json.dumps({"proposal": {"id": "prop1", "payout": 306.0, "spot": 45000.0}})
+        request = self.sent[-1]
+        if "proposal" in request:
+            return json.dumps({"echo_req": request, "msg_type": "proposal", "req_id": request.get("req_id"),
+                               "proposal": {"id": "prop1", "payout": 306.0, "spot": 45000.0}})
         if self.buy_reply == "hang":
             await asyncio.sleep(5)
-        return json.dumps(self.buy_reply)
+        reply = self.buy_reply(request) if callable(self.buy_reply) else self.buy_reply
+        return json.dumps(reply)
 
     @property
     def buys(self):
@@ -106,6 +131,7 @@ def test_successful_buy_is_recorded_and_resolves_its_intent(deriv):
     assert (trade.contract_id, trade.status, trade.price) == ("555001", "OPEN", 170.0)
     [intent] = _intents()
     assert (intent.status, intent.contract_id, intent.trade_id) == ("EXECUTED", "555001", trade.id)
+    assert [m.get("req_id") for m in fake.sent] == [deriv_engine.PROPOSAL_REQ_ID, deriv_engine.BUY_REQ_ID]
     assert len(fake.buys) == 1
     assert RiskManager().can_trade()["allowed"]
 
@@ -172,6 +198,21 @@ def test_ambiguous_buy_is_never_retried_and_blocks_trading(deriv, monkeypatch):
     assert len(fake.buys) == 1
 
 
+def test_process_stopped_during_buy_leaves_a_blocking_pending_intent(deriv):
+    def killed(request):
+        raise ProcessKilled()
+
+    fake = deriv(killed)
+
+    with pytest.raises(ProcessKilled):
+        _buy()
+
+    [intent] = _intents()
+    assert intent.status == "PENDING"
+    assert len(fake.buys) == 1
+    assert not RiskManager().can_trade()["allowed"]
+
+
 def test_same_symbol_candle_and_direction_buys_once(deriv):
     fake = deriv(BUY_OK)
 
@@ -193,13 +234,27 @@ def test_no_buy_when_the_intent_cannot_be_recorded(deriv, monkeypatch):
 
 
 def test_deriv_refusal_buys_nothing_and_does_not_block(deriv):
-    fake = deriv({"error": {"code": "InvalidPrice", "message": "Price moved"},
-                  "msg_type": "buy", "echo_req": {"buy": "prop1", "price": 170.0}})
+    fake = deriv(refusal())
 
     assert _buy()["status"] == "error"
 
     assert len(fake.buys) == 1
     assert _trades() == []
+    assert _intents()[0].status == "FAILED"
+    assert RiskManager().can_trade()["allowed"]
+
+
+def test_unidentified_proposal_reply_buys_nothing(deriv, monkeypatch):
+    fake = deriv(BUY_OK)
+
+    async def recv():
+        return json.dumps({"proposal": {"id": "prop1", "payout": 306.0, "spot": 45000.0}})
+
+    monkeypatch.setattr(fake, "recv", recv)
+
+    assert _buy()["status"] == "error"
+
+    assert fake.buys == []
     assert _intents()[0].status == "FAILED"
     assert RiskManager().can_trade()["allowed"]
 
@@ -210,8 +265,50 @@ def test_missing_candle_time_refuses_to_trade(deriv):
     assert fake.sent == [] and _intents() == []
 
 
+UNRELATED_ERROR = {"code": "RateLimit", "message": "Rate limit reached"}
+
+
+@pytest.mark.parametrize("reply", [
+    {"error": UNRELATED_ERROR},
+    {"error": UNRELATED_ERROR, "msg_type": "proposal", "echo_req": {"proposal": 1}, "req_id": 1},
+    refusal(echo_req={"buy": "another-proposal", "price": 170.0, "req_id": 2}),
+    refusal(req_id=99),
+], ids=["no identity", "other message type", "other proposal", "other req_id"])
+def test_error_not_identifiable_as_the_buy_reply_is_ambiguous_not_a_refusal(deriv, reply):
+    fake = deriv(reply)
+
+    result = _buy()
+
+    assert result["status"] == "reconciliation_required"
+    [intent] = _intents()
+    assert intent.status == "AMBIGUOUS" and "not identifiable" in intent.error
+    assert len(fake.buys) == 1
+    assert not RiskManager().can_trade()["allowed"]
+    assert _buy()["status"] == "duplicate"
+    assert len(fake.buys) == 1
+
+
+def test_buy_receipt_with_the_wrong_req_id_keeps_its_contract_id_and_blocks(deriv):
+    fake = deriv(buy_reply(req_id=99))
+
+    result = _buy()
+
+    assert result == {"status": "reconciliation_required", "intent_id": result["intent_id"], "contract_id": 555001}
+    [intent] = _intents()
+    assert (intent.status, intent.contract_id) == ("UNRECORDED", "555001")
+    assert _trades() == []
+    assert not RiskManager().can_trade()["allowed"]
+
+    DerivEngine()._record_unrecorded_intents()
+
+    [trade] = _trades()
+    assert (trade.contract_id, trade.status) == ("555001", "OPEN")
+    assert len(fake.buys) == 1
+
+
 def _pipeline_always_buys(monkeypatch):
-    """Real DerivEngine against FakeDeriv; closed candles; every bar signals BUY."""
+    """Real DerivEngine against FakeDeriv; closed candles; every bar signals BUY;
+    the clock just after the last candle closed."""
     rng = np.random.default_rng(2)
     close = 100 + np.cumsum(rng.normal(0, 0.5, 400))
     open_ = np.r_[close[0], close[:-1]]
@@ -220,6 +317,9 @@ def _pipeline_always_buys(monkeypatch):
          "Close": close, "Volume": 1000.0},
         index=pd.date_range("2026-09-01", periods=400, freq="15min"),
     )
+    last_close = (candles.index[-1] + pd.Timedelta(minutes=15)).tz_localize("UTC").to_pydatetime()
+    monkeypatch.setattr(pipeline_module, "_now", lambda: last_close + timedelta(seconds=10))
+    monkeypatch.setattr(pipeline_module, "_sleep", lambda seconds: None)
     monkeypatch.setattr(pipeline_module.DerivDataProvider, "fetch_data", lambda self, symbol: candles)
     monkeypatch.setattr(DerivEngine, "reconcile_open_contracts", lambda self: None)
     monkeypatch.setattr(pipeline_module.technical_strategy, "generate_signal", lambda row, **kw: {
@@ -237,28 +337,6 @@ def test_rerunning_a_cycle_on_the_same_closed_candle_buys_once(deriv, monkeypatc
 
     assert first["TEST_RERUN"]["action"] == "BUY"
     assert second["TEST_RERUN"]["action"] == "DUPLICATE_SKIPPED"
-    assert len(fake.buys) == 1
-
-
-UNRELATED_ERROR = {"code": "RateLimit", "message": "Rate limit reached"}
-
-
-@pytest.mark.parametrize("reply", [
-    {"error": UNRELATED_ERROR},
-    {"error": UNRELATED_ERROR, "msg_type": "proposal", "echo_req": {"proposal": 1}},
-    {"error": UNRELATED_ERROR, "msg_type": "buy", "echo_req": {"buy": "another-proposal", "price": 170.0}},
-], ids=["no identity", "other message type", "other proposal"])
-def test_error_not_identifiable_as_the_buy_reply_is_ambiguous_not_a_refusal(deriv, reply):
-    fake = deriv(reply)
-
-    result = _buy()
-
-    assert result["status"] == "reconciliation_required"
-    [intent] = _intents()
-    assert intent.status == "AMBIGUOUS" and "not identifiable" in intent.error
-    assert len(fake.buys) == 1
-    assert not RiskManager().can_trade()["allowed"]
-    assert _buy()["status"] == "duplicate"
     assert len(fake.buys) == 1
 
 
