@@ -1,0 +1,38 @@
+# Secrets: pass at runtime, never bake into the image
+.env
+.env.*
+
+# VCS / tooling
+.git
+.gitignore
+.claude
+.DS_Store
+Dockerfile
+.dockerignore
+
+# Python caches and local environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Tests (mounted in only for the in-container test run)
+tests/
+
+# Local runtime state, logs, databases, caches
+*.log
+*.err
+*.orig
+*.bak
+macs.db
+.heartbeat_state.json
+.backtest_cache/
+features.csv
+ml/artifacts/
+
+# Frontend and macOS-only files the worker never uses
+dashboard/
+node_modules/
+com.macsv2.daemon.plist
