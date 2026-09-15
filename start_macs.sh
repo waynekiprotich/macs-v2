@@ -14,7 +14,12 @@ fi
 
 while true; do
     echo "Running analysis cycle at $(date)..."
-    python3 run.py analyze
+    # Skip the cycle rather than trade when the database can't record it.
+    if python3 -m scripts.preflight; then
+        python3 run.py analyze
+    else
+        echo "Preflight failed; skipping this cycle."
+    fi
     echo "Cycle complete. Sleeping 900s..."
     sleep 900
 done

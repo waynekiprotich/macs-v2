@@ -19,6 +19,8 @@ websockets==10.3
 APScheduler==3.10.4
 sqlalchemy==2.0.30
 click==8.1.7
+# Imported directly by data_deriv.py, deriv_engine.py and notifications.py.
+requests==2.34.2
 rich==13.7.1
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9

@@ -28,6 +28,8 @@ else:
     # failing the first query of a pipeline cycle.
     engine_options = {
         "pool_pre_ping": True,
+        # Without a timeout an unreachable pooler blocks a cycle indefinitely.
+        "connect_args": {"connect_timeout": 10},
         "pool_size": settings.DB_POOL_SIZE,
         "max_overflow": settings.DB_MAX_OVERFLOW,
         "pool_recycle": 1800,
