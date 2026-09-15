@@ -1,15 +1,17 @@
+import contextlib
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import func
 
-from models.database import MarketSnapshot, SessionLocal, SystemLog
+from models.database import MarketSnapshot, SessionLocal, SystemLog, engine
 from .data_deriv import DerivDataProvider
 from .indicators import compute_indicators
+from .instance_lock import trading_lock
 from .regime import detect_regime
 from .risk_management import RiskManager
 from . import technical_strategy
@@ -18,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 # fetch_data() defaults to 15m candles.
 GRANULARITY_SECONDS = 900
+
+# execute_trade() status -> signals.action_taken. Anything else is a failure
+# in which nothing was bought.
+EXECUTION_ACTIONS = {
+    "success": "EXECUTED",
+    "duplicate": "DUPLICATE_SKIPPED",
+    "reconciliation_required": "RECONCILIATION_REQUIRED",
+}
 
 
 def _json_safe(value):
@@ -44,6 +54,20 @@ def _utc(ts) -> datetime:
     return (ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")).to_pydatetime()
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _closed_bars(df: pd.DataFrame, granularity: int, now: datetime) -> pd.DataFrame:
+    """Keep only bars that have closed. Deriv's ticks_history returns the
+    still-forming bar last; a bar indexed by its open time has closed once
+    open + granularity <= now."""
+    if df.empty:
+        return df
+    opens = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+    return df[opens + pd.Timedelta(seconds=granularity) <= pd.Timestamp(now)]
+
+
 class TradingPipeline:
     def __init__(self, symbols: List[str], db_path: str = "trading.db"):
         self.symbols = symbols
@@ -51,30 +75,49 @@ class TradingPipeline:
         self.data_provider = DerivDataProvider()
 
     def run(self, execute: bool = True) -> dict:
-        """Orchestrate data->indicators->regime->scoring->strategies->risk->execution"""
+        """Orchestrate data->indicators->regime->scoring->strategies->risk->execution,
+        holding the single-instance trading lock for the whole cycle."""
         logger.info("Starting pipeline run...")
+        with contextlib.ExitStack() as stack:
+            try:
+                acquired = stack.enter_context(trading_lock(engine))
+            except Exception as e:
+                logger.error(f"Could not check the trading lock; skipping this cycle: {e}")
+                return self._blocked(f"Trading lock unavailable: {e}")
+            if not acquired:
+                logger.warning("Another MACS worker holds the trading lock; skipping this cycle.")
+                return self._blocked("Another MACS worker is running")
+            return self._run_locked(execute)
+
+    def _blocked(self, reason: str) -> dict:
+        return {s: {"action": "BLOCKED", "confidence": 0, "reason": reason} for s in self.symbols}
+
+    def _run_locked(self, execute: bool) -> dict:
         outcomes = {s: {"action": "HOLD", "confidence": 0, "reason": "Not yet processed"} for s in self.symbols}
 
-        # 1. Reconcile open contracts first
+        # 1. Reconcile open contracts first, then read risk state, so contracts
+        # that settled since the last cycle count toward this cycle's decisions.
         from execution.deriv_engine import DerivEngine
         try:
             DerivEngine().reconcile_open_contracts()
         except Exception as e:
             logger.error(f"Failed to reconcile contracts: {e}")
 
+        self.risk_manager.reload()
         risk_status = self.risk_manager.can_trade()
         if not risk_status['allowed']:
             logger.warning(f"Trading blocked by risk manager: {risk_status['reason']}")
             self.risk_manager.record_block()
-            outcomes = {s: {"action": "BLOCKED", "confidence": 0, "reason": risk_status['reason']} for s in self.symbols}
-            return outcomes
+            return self._blocked(risk_status['reason'])
 
         for symbol in self.symbols:
             logger.info(f"Processing symbol: {symbol}")
 
             df = self.data_provider.fetch_data(symbol)
+            # Signals are evaluated on closed bars only: the forming bar's close is still moving.
+            df = _closed_bars(df, GRANULARITY_SECONDS, _now())
             if df.empty:
-                outcomes[symbol] = {"action": "NO DATA", "confidence": 0, "reason": "No candles returned from Deriv"}
+                outcomes[symbol] = {"action": "NO DATA", "confidence": 0, "reason": "No closed candles returned from Deriv"}
                 continue
 
             df = compute_indicators(df)
@@ -112,11 +155,22 @@ class TradingPipeline:
             }
 
             if signal in ('BUY', 'SELL'):
+                if signal_id is None:
+                    # No signals row: the trade could be neither audited nor linked.
+                    logger.error(f"Trade blocked for {symbol}: the signal could not be recorded")
+                    outcomes[symbol]["action"] = "HOLD"
+                    outcomes[symbol]["reason"] = "Signal not recorded; trade blocked"
+                    continue
+                # Re-read right before each trade: an earlier trade this cycle
+                # may have left a contract that needs reconciliation.
+                self.risk_manager.reload()
                 risk_status = self.risk_manager.can_trade()
                 if risk_status['allowed']:
                     if execute:
                         res = self.execute_trade(symbol, signal, latest, signal_id=signal_id)
-                        action_taken = "EXECUTED" if res.get("status") == "success" else "EXECUTION_FAILED"
+                        action_taken = EXECUTION_ACTIONS.get(res.get("status"), "EXECUTION_FAILED")
+                        if action_taken != "EXECUTED":
+                            outcomes[symbol]["action"] = action_taken
                     else:
                         logger.info(f"[DRY RUN] Would execute {signal} for {symbol} at {latest.get('Close', 0):.2f}")
                         action_taken = "DRY_RUN"
@@ -129,20 +183,23 @@ class TradingPipeline:
             else:
                 action_taken = "VOLATILITY_SKIP" if is_volatile else "HOLD"
             self._set_action_taken(signal_id, action_taken)
+            if action_taken == "RECONCILIATION_REQUIRED":
+                logger.critical("Halting this cycle: a Deriv contract needs reconciliation before any further trade.")
+                break
 
         logger.info("Pipeline run completed.")
         return outcomes
 
     def _store_snapshots(self, symbol: str, df: pd.DataFrame) -> None:
-        """Persist closed bars not stored yet. The last bar is still forming,
-        so it's stored on a later cycle once it has closed. The first run
-        backfills everything the fetch returned."""
+        """Persist bars not stored yet. run() passes closed bars only, so the
+        forming bar is stored on a later cycle once it has closed. The first
+        run backfills everything the fetch returned."""
         db = SessionLocal()
         try:
             latest_stored = db.query(func.max(MarketSnapshot.candle_time)).filter(
                 MarketSnapshot.symbol == symbol, MarketSnapshot.granularity == GRANULARITY_SECONDS
             ).scalar()
-            closed = df.iloc[:-1]
+            closed = df
             if latest_stored is not None:
                 closed = closed[[_utc(ts) > _utc(latest_stored) for ts in closed.index]]
             db.add_all([
@@ -235,6 +292,7 @@ class TradingPipeline:
             confidence=confidence,
             regime=regime,
             signal_id=signal_id,
+            candle_time=_utc(data_row.name),
         )
         logger.info(f"Execution Result: {res}")
         return res

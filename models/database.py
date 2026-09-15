@@ -249,6 +249,45 @@ class RiskEvent(Base):
     details = Column(JSONType, nullable=True)
 
 
+# A trade intent in any of these states may stand for a contract Deriv sold
+# that trades doesn't have; RiskManager blocks trading while one exists.
+UNRESOLVED_INTENT_STATUSES = ("PENDING", "AMBIGUOUS", "UNRECORDED")
+
+
+class TradeIntent(Base):
+    """A BUY claimed before it is sent to Deriv, one per symbol, closed candle
+    and direction, so one signal can never buy twice. It is committed before
+    the buy, so a contract that was bought but never recorded still leaves a
+    row behind.
+
+    PENDING: claimed; the buy is about to be sent, or the process died.
+    FAILED: Deriv refused or the buy was never sent; nothing was bought.
+    EXECUTED: bought and recorded in trades (trade_id).
+    AMBIGUOUS: the buy was sent but no usable response came back.
+    UNRECORDED: bought (contract_id known) but the trades row wasn't written;
+        reconciliation writes it from details.
+    RESOLVED: an operator settled an unresolved row by hand.
+    """
+    __tablename__ = "trade_intents"
+    __table_args__ = (UniqueConstraint("symbol", "candle_time", "side"),)
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(UTCDateTime, nullable=False, default=_utcnow)
+    updated_at = Column(UTCDateTime, nullable=True)
+    symbol = Column(String, nullable=False)
+    candle_time = Column(UTCDateTime, nullable=False)  # open time of the closed bar the signal was on
+    side = Column(String, nullable=False)  # BUY / SELL
+    stake = Column(Float, nullable=False)
+    status = Column(String, index=True, nullable=False, default="PENDING")
+    contract_id = Column(String, nullable=True)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="SET NULL"), nullable=True)
+    trade_id = Column(Integer, ForeignKey("trades.id", ondelete="SET NULL"), nullable=True)
+    error = Column(String, nullable=True)
+    # The trades row as it would have been written, so an UNRECORDED contract
+    # can be recorded later without asking Deriv to buy anything.
+    details = Column(JSONType, nullable=True)
+
+
 def init_db():
     try:
         Base.metadata.create_all(bind=engine)

@@ -3,10 +3,14 @@
 MACS-V2 runs as a background worker with no HTTP port. `start_macs.sh` loops forever:
 preflight check, then `python3 run.py analyze` (one pipeline cycle), then sleep 900 s.
 
-**Current status: do not let a deployment trade yet.** The open safety issues at the end of
-this file allow real $170 contracts to be bought without being recorded. The strategy is also
-unproven. On Deriv's own 15m candles it measured about 47.9% (OTC_DJI) and 48.9% (frxXAUUSD)
-against a breakeven of about 55.6%.
+**Current status: do not let a deployment trade yet.**
+
+- The production database is at revision `0002`; this code needs `0003`. Until
+  `alembic upgrade head` runs, the preflight skips every cycle.
+- The safety mechanisms below are implemented and covered by tests, but have not run against
+  the production database or Deriv.
+- The strategy is unproven. On Deriv's own 15m candles it measured about 47.9% (OTC_DJI) and
+  48.9% (frxXAUUSD), against a breakeven of about 55.6%.
 
 ## Environment variables
 
@@ -15,7 +19,7 @@ Set these on the host at runtime. The image contains no secrets, and `.env` is e
 
 | Variable | Required | Notes |
 |---|---|---|
-| `DATABASE_URL` | yes | Supabase **Session pooler** URI: user `postgres.<project-ref>`, host `aws-0-<region>.pooler.supabase.com`, port `5432`. `sslmode=require` is appended automatically. URL-encode special characters in the password. |
+| `DATABASE_URL` | yes | Supabase **Session pooler** URI: user `postgres.<project-ref>`, host `aws-X-<region>.pooler.supabase.com`, port `5432`. Copy it from the dashboard. `sslmode=require` is appended automatically. Do not use the direct `db.<ref>.supabase.co` host (IPv6-only) or the transaction pooler on port `6543` (it cannot hold the trading lock). URL-encode special characters in the password. |
 | `DERIV_API_TOKEN` | yes | |
 | `DERIV_APP_ID` | yes | |
 | `DISCORD_WEBHOOK_URL` | no | Leave unset to disable alerts. Do not quote values in a Docker `--env-file`: quotes are kept literally. |
@@ -24,18 +28,18 @@ Set these on the host at runtime. The image contains no secrets, and `.env` is e
 The Deriv account ID is hardcoded in `execution/deriv_engine.py` and `core/data_deriv.py`.
 The stake ($170) and contract duration (15m) come from code and `config/settings.py`.
 
-## One-time database initialisation
+## Database schema
 
-Create the schema with Alembic, and only with Alembic. `scripts/run_init.py` and the API
-server's startup `init_db()` use `create_all`, which creates tables without an
-`alembic_version` row. After that, `alembic upgrade head` fails and the preflight refuses to run.
+Create and upgrade the schema with Alembic, and only with Alembic. `scripts/run_init.py` and the
+API server's startup `init_db()` use `create_all`, which creates tables without an
+`alembic_version` row.
 
 ```bash
 docker run --rm --env-file .env macs-v2 alembic upgrade head
 ```
 
-For an empty database this creates every table and enables row level security (migration
-`0002`). It is safe to re-run: at head it does nothing.
+Migration `0003` adds the `trade_intents` table (with row level security). It creates a new
+table and changes no existing ones. Re-running at head does nothing.
 
 ## Preflight
 
@@ -44,15 +48,78 @@ and does not trade:
 
 - a Deriv credential is missing;
 - the database is SQLite without `MACS_ALLOW_SQLITE=1`;
+- the database is on port 6543;
 - the database is unreachable (10 s connect timeout);
 - the schema is not at the Alembic head.
-
-It checks once per cycle, not per trade. A database that fails *during* a cycle is still
-unprotected (see issue 1).
 
 ```bash
 docker run --rm --env-file .env macs-v2 python -m scripts.preflight
 ```
+
+## Trading safety mechanisms
+
+Each of these is covered by tests in `tests/`.
+
+1. **Every buy is claimed before it is sent.** `execute_signal` commits a `trade_intents` row
+   (`PENDING`) before contacting Deriv. If that write fails, nothing is bought.
+2. **One trade per symbol, closed candle and direction.** A unique constraint on
+   `trade_intents (symbol, candle_time, side)` turns a second attempt (a restarted worker, a
+   second worker, a re-run cycle) into `DUPLICATE_SKIPPED`, before Deriv is contacted.
+3. **A bought contract never silently disappears.** The contract ID is logged as soon as Deriv
+   confirms the buy. The `trades` row and the intent's `EXECUTED` status are written in one
+   transaction. If that fails:
+   - the worker logs `RECONCILIATION REQUIRED` at CRITICAL, with the contract ID;
+   - it marks the intent `UNRECORDED`, with the contract ID and the full row it meant to write;
+   - it sends a Discord alert and stops the cycle.
+
+   If even that update fails, the intent stays `PENDING`. Either way it keeps trading blocked.
+4. **An ambiguous buy is never retried.** If the buy request was sent but no usable reply came
+   back (timeout, dropped connection, malformed reply), the intent becomes `AMBIGUOUS` (or
+   `UNRECORDED` if a contract ID was seen). The cycle stops, and trading stays blocked. An error
+   reply counts as a refusal (`FAILED`, nothing bought) only when it identifies itself as the
+   reply to this buy: `msg_type` `buy`, with `echo_req.buy` equal to the proposal ID. Any other
+   error is `AMBIGUOUS`.
+5. **Reconciliation records what it can.** At the start of each cycle, `UNRECORDED` intents are
+   written to `trades` from the stored contract ID, without buying anything. Then every `OPEN`
+   contract is settled from Deriv. A settlement reply for a different contract ID is ignored.
+6. **The risk manager fails closed.** `can_trade()` blocks when:
+   - risk state could not be read, instead of assuming zero PnL and zero losses;
+   - the state is more than 5 minutes old;
+   - any intent is `PENDING`, `AMBIGUOUS` or `UNRECORDED`;
+   - any `OPEN` contract is at or past expiry (with a 30 s margin), or has no recorded expiry.
+     Its outcome would be missing from the loss limits, so the cycle waits for reconciliation;
+   - the circuit breaker or the daily loss limit applies.
+
+   State is re-read after reconciliation, and again right before every trade.
+7. **No trade without a recorded signal.** If the `signals` row cannot be written, the BUY/SELL
+   is not executed.
+8. **Closed candles only.** Bars whose close time is in the future (Deriv's forming bar) are
+   dropped before indicators are computed. The signal is evaluated on the last closed bar, and
+   the strategy itself is unchanged. Live signals now fire on the same bars the backtest scores,
+   one bar later than the previous live behaviour.
+9. **One worker at a time.** Each cycle holds a Postgres session advisory lock (a file lock on
+   SQLite). A second worker skips its cycle. The server releases the lock if the worker dies.
+10. **Bounded network waits.** Deriv OTP requests have a 10 s timeout. Every websocket connect,
+    send and receive on the buy and reconcile paths has a 15 s timeout.
+
+## Resolving a blocked worker
+
+`risk_events` gets a `RECONCILIATION_REQUIRED` row, and the log names the intent IDs. For each
+unresolved intent:
+
+```sql
+SELECT id, created_at, symbol, side, candle_time, status, contract_id, error
+FROM trade_intents WHERE status IN ('PENDING', 'AMBIGUOUS', 'UNRECORDED');
+```
+
+- **`UNRECORDED` with a contract ID:** nothing to do; the next cycle records and settles it.
+- **`PENDING` or `AMBIGUOUS`:** find the contract in the Deriv statement (symbol, direction, time
+  around `created_at`). Then run one of:
+  - it exists: `UPDATE trade_intents SET status = 'UNRECORDED', contract_id = '<id>' WHERE id = <intent id>;`
+    (the next cycle records it);
+  - it does not exist: `UPDATE trade_intents SET status = 'RESOLVED', error = 'No contract on Deriv statement' WHERE id = <intent id>;`
+
+Never mark an intent `RESOLVED` without checking the Deriv statement.
 
 ## Build and run
 
@@ -68,46 +135,32 @@ docker run -d --name macs --restart unless-stopped --env-file .env macs-v2
 
 - Railway uses the `Dockerfile` automatically when one is present. The start command is the
   image `CMD`, so do not override it.
-- Run exactly **one** replica, and never run the Mac launchd daemon (`com.macsv2.daemon`) at the
-  same time. Nothing in the code prevents two instances from trading the same account (issue 4).
+- Run one replica. The trading lock and trade intents stop duplicate trades, but a second replica
+  only wastes cycles.
+- Never run the Mac launchd daemon (`com.macsv2.daemon`) against the same account.
 - Set the variables above in the service settings, not in a committed file.
-- Run the Alembic initialisation step against the production database before the first start.
+- Run `alembic upgrade head` against the production database before the first start.
 
-## Open safety issues (not fixed)
+## Remaining limitations
 
-These are documented, not solved. Fix them, with tests, before a deployment is allowed to trade.
-
-1. **Trades can be bought but not recorded.** `execution/deriv_engine.py` buys the contract and
-   only then writes the `trades` row. If that write fails, the error is logged
-   (`Failed to log Deriv trade`), nothing retries, and the Discord alert is skipped, so the
-   contract is invisible to the database, reconciliation and the risk manager.
-2. **The risk manager fails open.** `core/risk_management.py` `_load_state` logs a database error
-   and keeps `daily_pnl = 0` and `consecutive_losses = 0`, so `can_trade()` allows trading. Its
-   state is also loaded in `TradingPipeline.__init__`, *before* `run()` reconciles open
-   contracts, so losses settled since the last cycle are missed for one cycle.
-3. **A failed signal write does not stop a trade.** `core/pipeline.py` `_log_signal` returns
-   `None` on error and execution continues with `signal_id=None`.
-4. **No single-instance or duplicate-trade protection.** There is no lock, no unique constraint on
-   `trades.contract_id`, and no idempotency key per `(symbol, candle_time)`. Two workers, or a
-   restarted worker inside the same 15m bar, can buy twice on one signal.
-5. **Signals use the forming candle.** Deriv's `ticks_history` returns the still-forming bar
-   last, and `core/pipeline.py` evaluates `df.iloc[-1]`. Closed-bar and forming-bar signals
-   disagreed on more than half of the bars measured. Changing this changes which trades fire, so
-   it needs its own reviewed change.
-6. **No network timeouts on the buy path.** In `execution/deriv_engine.py`, the OTP
-   `requests.post` and every `ws.recv()` (proposal, buy, reconcile) have no timeout, so a hung
-   connection stalls the worker indefinitely.
-7. **Reconciliation is best-effort.** Contracts whose status cannot be read stay `OPEN`, and
-   responses are matched to requests by order, not by `req_id`.
-8. **Shutdown can interrupt a buy.** `docker stop` or a redeploy during a cycle can kill the
-   process between the Deriv buy and the database write (the same outcome as issue 1).
-9. **`MACS_MODE` is only a label.** It defaults to `PAPER`, but `analyze` without `--dry-run`
+1. **Operator action is needed after an ambiguous buy.** A `PENDING` or `AMBIGUOUS` intent
+   without a contract ID blocks trading until someone checks the Deriv statement (see above). The
+   code does not look contracts up by time.
+2. **Shutdown during a buy** (`docker stop`, a redeploy) can leave a `PENDING` intent. That now
+   blocks trading instead of losing the contract, but it still needs the manual step.
+3. **The lock covers a cycle, not a connection loss.** If the lock's database connection drops
+   mid-cycle, a second worker could start. Trade intents still stop it buying the same symbol,
+   candle and direction.
+4. **Open exposure is not limited.** The daily loss limit counts settled contracts only.
+5. **`MACS_MODE` is only a label.** It defaults to `PAPER`, but `analyze` without `--dry-run`
    places real Deriv contracts on the configured account.
+6. **No end-to-end run yet.** None of this has run against the production database or Deriv.
+   Watch the first cycles in dry run.
 
 ### Unrecorded contracts from earlier runs
 
-These were bought while the database was unreachable, and they are not in `trades`. Reconcile
-them by hand from the Deriv statement; the code cannot recover them.
+These were bought while the database was unreachable, before trade intents existed, and they
+are not in `trades`. Reconcile them by hand from the Deriv statement.
 
 - Railway: `12898580519`, one contract at about 10:17 UTC on 2026-09-14 (ID not in the logs),
   `12929687739` and `12929699399`.
