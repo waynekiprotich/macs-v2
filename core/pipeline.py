@@ -1,14 +1,15 @@
 import contextlib
 import logging
 import math
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import func
 
-from models.database import MarketSnapshot, SessionLocal, SystemLog, engine
+from models.database import MarketSnapshot, PaperTrade, SessionLocal, SystemLog, engine
 from .data_deriv import DerivDataProvider
 from .indicators import compute_indicators
 from .instance_lock import trading_lock
@@ -20,6 +21,15 @@ logger = logging.getLogger(__name__)
 
 # fetch_data() defaults to 15m candles.
 GRANULARITY_SECONDS = 900
+
+# A BUY/SELL decided more than this many seconds after its candle closed is not
+# traded: the entry would no longer be the close the signal was computed on.
+MAX_SIGNAL_AGE_SECONDS = 120
+# An OPEN contract expiring within this many seconds is waited for, so the
+# cycle reconciles it instead of being blocked by it...
+SETTLEMENT_WAIT_SECONDS = 60
+# ...plus this long after expiry for Deriv to settle it.
+SETTLEMENT_BUFFER_SECONDS = 10
 
 # execute_trade() status -> signals.action_taken. Anything else is a failure
 # in which nothing was bought.
@@ -58,6 +68,10 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _closed_bars(df: pd.DataFrame, granularity: int, now: datetime) -> pd.DataFrame:
     """Keep only bars that have closed. Deriv's ticks_history returns the
     still-forming bar last; a bar indexed by its open time has closed once
@@ -92,12 +106,38 @@ class TradingPipeline:
     def _blocked(self, reason: str) -> dict:
         return {s: {"action": "BLOCKED", "confidence": 0, "reason": reason} for s in self.symbols}
 
+    def _wait_for_expiring_contracts(self) -> None:
+        """Wait for OPEN contracts expiring within SETTLEMENT_WAIT_SECONDS to
+        expire and settle, so this cycle can reconcile them. Later expiries are
+        not waited for, and a failed read skips the wait: the risk check that
+        follows still blocks on anything unsettled."""
+        now = _now()
+        db = SessionLocal()
+        try:
+            expiries = [_utc(expiry) for (expiry,) in db.query(PaperTrade.expiry_time).filter(
+                PaperTrade.status == "OPEN", PaperTrade.expiry_time.isnot(None)
+            ).all()]
+        except Exception as e:
+            logger.error(f"Could not read open contract expiries: {e}")
+            return
+        finally:
+            db.close()
+
+        buffer = timedelta(seconds=SETTLEMENT_BUFFER_SECONDS)
+        horizon = now + timedelta(seconds=SETTLEMENT_WAIT_SECONDS)
+        settles = [expiry + buffer for expiry in expiries if expiry <= horizon and expiry + buffer > now]
+        if settles:
+            wait = (max(settles) - now).total_seconds()
+            logger.info(f"Waiting {wait:.0f}s for {len(settles)} contract(s) to expire and settle before reconciling.")
+            _sleep(wait)
+
     def _run_locked(self, execute: bool) -> dict:
         outcomes = {s: {"action": "HOLD", "confidence": 0, "reason": "Not yet processed"} for s in self.symbols}
 
         # 1. Reconcile open contracts first, then read risk state, so contracts
         # that settled since the last cycle count toward this cycle's decisions.
         from execution.deriv_engine import DerivEngine
+        self._wait_for_expiring_contracts()
         try:
             DerivEngine().reconcile_open_contracts()
         except Exception as e:
@@ -160,6 +200,16 @@ class TradingPipeline:
                     logger.error(f"Trade blocked for {symbol}: the signal could not be recorded")
                     outcomes[symbol]["action"] = "HOLD"
                     outcomes[symbol]["reason"] = "Signal not recorded; trade blocked"
+                    continue
+                signal_age = (_now() - _utc(latest.name)).total_seconds() - GRANULARITY_SECONDS
+                if signal_age > MAX_SIGNAL_AGE_SECONDS:
+                    logger.warning(
+                        f"Trade skipped for {symbol}: its candle closed {signal_age:.0f}s ago "
+                        f"(limit {MAX_SIGNAL_AGE_SECONDS}s)"
+                    )
+                    outcomes[symbol]["action"] = "STALE_SIGNAL"
+                    outcomes[symbol]["reason"] = f"Candle closed {signal_age:.0f}s ago; not traded"
+                    self._set_action_taken(signal_id, "STALE_SIGNAL")
                     continue
                 # Re-read right before each trade: an earlier trade this cycle
                 # may have left a contract that needs reconciliation.

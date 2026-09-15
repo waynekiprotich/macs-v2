@@ -3,14 +3,20 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from core import pipeline as pipeline_module
+from core import risk_management
 from core.instance_lock import trading_lock
 from core.pipeline import TradingPipeline, _closed_bars
-from models.database import MarketSnapshot, PaperTrade, RiskEvent, SessionLocal, SystemLog, engine
+from models.database import MarketSnapshot, PaperTrade, RiskEvent, SessionLocal, SystemLog, TradeIntent, engine
 
 SYMBOL = "TEST_PIPE"
 EVALUATED = []
+SLEEPS = []
+# _candles() ends with the bar opening 2026-09-05 03:45, which closes at 04:00.
+LAST_CLOSE = datetime(2026, 9, 5, 4, 0, tzinfo=timezone.utc)
+NOW = LAST_CLOSE + timedelta(seconds=10)
 
 
 def _candles(n: int = 400, last_open=None) -> pd.DataFrame:
@@ -42,10 +48,13 @@ def run_pipeline(monkeypatch, clean_trading_tables):
     candles = _candles()
     monkeypatch.setattr(pipeline_module.DerivDataProvider, "fetch_data", lambda self, symbol: candles)
     monkeypatch.setattr("execution.deriv_engine.DerivEngine", FakeEngine)
+    monkeypatch.setattr(pipeline_module, "_now", lambda: NOW)
+    monkeypatch.setattr(pipeline_module, "_sleep", SLEEPS.append)
     FakeEngine.calls = []
     EVALUATED.clear()
+    SLEEPS.clear()
 
-    def run(signal: str, symbols=(SYMBOL,)) -> dict:
+    def run(signal: str, symbols=(SYMBOL,), execute: bool = True) -> dict:
         def generate_signal(row, **kw):
             EVALUATED.append(row.name)
             return {
@@ -54,7 +63,7 @@ def run_pipeline(monkeypatch, clean_trading_tables):
             }
 
         monkeypatch.setattr(pipeline_module.technical_strategy, "generate_signal", generate_signal)
-        return TradingPipeline(list(symbols)).run(execute=True)
+        return TradingPipeline(list(symbols)).run(execute=execute)
 
     return run
 
@@ -136,7 +145,7 @@ def test_signal_is_evaluated_on_the_last_closed_bar_not_the_forming_one(run_pipe
     last_closed = forming_open - pd.Timedelta(minutes=15)
     candles = _candles(last_open=forming_open)
     monkeypatch.setattr(pipeline_module.DerivDataProvider, "fetch_data", lambda self, symbol: candles)
-    monkeypatch.setattr(pipeline_module, "_now", lambda: datetime(2026, 9, 15, 11, 7, tzinfo=timezone.utc))
+    monkeypatch.setattr(pipeline_module, "_now", lambda: datetime(2026, 9, 15, 11, 0, 10, tzinfo=timezone.utc))
 
     run_pipeline("BUY", symbols=("TEST_FORMING",))
 
@@ -268,4 +277,112 @@ def test_reconciled_loss_counts_toward_the_circuit_breaker_before_the_next_trade
     outcome = run_pipeline("BUY")[SYMBOL]
 
     assert outcome["action"] == "BLOCKED" and "Circuit breaker" in outcome["reason"]
+    assert FakeEngine.calls == []
+
+
+def test_dry_run_evaluates_a_buy_signal_but_never_reaches_the_engine(run_pipeline):
+    outcome = run_pipeline("BUY", execute=False)[SYMBOL]
+
+    assert outcome["action"] == "BUY"
+    assert FakeEngine.calls == []
+    db = SessionLocal()
+    try:
+        assert _latest_signal(db).action_taken == "DRY_RUN"
+        assert db.query(TradeIntent).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("seconds_after_close, traded", [(119, True), (121, False)])
+def test_signal_older_than_the_limit_is_not_traded(run_pipeline, monkeypatch, seconds_after_close, traded):
+    monkeypatch.setattr(pipeline_module, "_now", lambda: LAST_CLOSE + timedelta(seconds=seconds_after_close))
+
+    outcome = run_pipeline("BUY")[SYMBOL]
+
+    assert (len(FakeEngine.calls) == 1) is traded
+    if not traded:
+        assert outcome["action"] == "STALE_SIGNAL"
+        db = SessionLocal()
+        try:
+            assert _latest_signal(db).action_taken == "STALE_SIGNAL"
+        finally:
+            db.close()
+
+
+def test_waits_for_a_contract_about_to_expire_then_reconciles_it(run_pipeline, monkeypatch):
+    contract = _add_trade(status="OPEN", contract_id="900010", timestamp=NOW - timedelta(minutes=15),
+                          expiry_time=NOW + timedelta(seconds=2))
+    order = []
+    monkeypatch.setattr(pipeline_module, "_sleep", lambda seconds: order.append(("sleep", seconds)))
+    monkeypatch.setattr(FakeEngine, "reconcile_open_contracts",
+                        lambda self: (order.append(("reconcile",)), _settle(contract, 116.59)))
+
+    assert run_pipeline("BUY")[SYMBOL]["action"] == "BUY"
+
+    assert order == [("sleep", pytest.approx(12.0)), ("reconcile",)]
+    assert len(FakeEngine.calls) == 1
+
+
+def test_does_not_wait_for_a_contract_expiring_later(run_pipeline):
+    _add_trade(status="OPEN", contract_id="900011", timestamp=NOW, expiry_time=NOW + timedelta(minutes=10))
+
+    run_pipeline("HOLD")
+
+    assert SLEEPS == []
+
+
+def test_trading_lock_that_cannot_be_checked_blocks_the_cycle(run_pipeline, monkeypatch):
+    def unavailable(engine):
+        raise OperationalError("SELECT pg_try_advisory_lock", {}, Exception("connection refused"))
+
+    monkeypatch.setattr(pipeline_module, "trading_lock", unavailable)
+
+    outcome = run_pipeline("BUY")[SYMBOL]
+
+    assert outcome["action"] == "BLOCKED" and "Trading lock unavailable" in outcome["reason"]
+    assert FakeEngine.calls == []
+
+
+class DownSession:
+    """A session on a database that has gone away: every query and commit fails."""
+
+    def query(self, *args, **kwargs):
+        raise OperationalError("SELECT", {}, Exception("connection refused"))
+
+    def add(self, *args, **kwargs):
+        pass
+
+    def commit(self):
+        raise OperationalError("COMMIT", {}, Exception("connection refused"))
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_database_unavailable_blocks_the_cycle(run_pipeline, monkeypatch):
+    monkeypatch.setattr(risk_management, "SessionLocal", DownSession)
+    monkeypatch.setattr(pipeline_module, "SessionLocal", DownSession)
+
+    outcome = run_pipeline("BUY")[SYMBOL]
+
+    assert outcome["action"] == "BLOCKED" and "Risk state unavailable" in outcome["reason"]
+    assert FakeEngine.calls == []
+
+
+@pytest.mark.parametrize("status", ["PENDING", "AMBIGUOUS", "UNRECORDED"])
+def test_unresolved_trade_intent_blocks_the_cycle(run_pipeline, status):
+    db = SessionLocal()
+    try:
+        db.add(TradeIntent(symbol="TEST_INTENT", side="BUY", candle_time=NOW, stake=170.0, status=status,
+                           contract_id="777" if status == "UNRECORDED" else None))
+        db.commit()
+    finally:
+        db.close()
+
+    outcome = run_pipeline("BUY")[SYMBOL]
+
+    assert outcome["action"] == "BLOCKED" and "unresolved trade intents" in outcome["reason"]
     assert FakeEngine.calls == []

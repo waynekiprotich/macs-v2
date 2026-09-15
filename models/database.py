@@ -65,6 +65,8 @@ class PaperTrade(Base):
     """One contract bought (Deriv) or simulated (paper). The class name
     predates the paper_trades -> trades rename; kept so imports keep working."""
     __tablename__ = "trades"
+    # One row per Deriv contract (migration 0004).
+    __table_args__ = (Index("uq_trades_contract_id", "contract_id", unique=True),)
 
     id = Column(Integer, primary_key=True)
     symbol = Column(String, index=True, nullable=False)
@@ -78,8 +80,10 @@ class PaperTrade(Base):
     proposal_id = Column(String, nullable=True)
     contract_id = Column(String, nullable=True)
     result = Column(String, nullable=True)
-    # Set to the quote at buy, then rewritten by reconcile from Deriv's
-    # sell_price/payout. quoted_payout keeps the untouched quote.
+    # What the contract pays on a win: Deriv's quote at buy, confirmed by
+    # reconcile. The same whether the contract won or lost; what it settled for
+    # is sell_price, and the result is pnl. Rows reconciled before this change
+    # can hold 0 for a loss; quoted_payout keeps the untouched quote.
     payout = Column(Float, nullable=True)
     tech_score = Column(Float, nullable=True)
     ai_score = Column(Float, nullable=True)

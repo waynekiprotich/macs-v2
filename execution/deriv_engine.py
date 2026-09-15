@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 # connection ends the cycle instead of stalling the worker.
 HTTP_TIMEOUT = 10
 WS_TIMEOUT = 15
+# req_id for the two requests on a buy connection. Deriv echoes req_id on the
+# reply, which is how a reply is tied to the request it answers.
+PROPOSAL_REQ_ID = 1
+BUY_REQ_ID = 2
 
 
 class AmbiguousBuyError(Exception):
@@ -48,6 +52,14 @@ def _float_or_none(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_float(info: dict, *keys):
+    for key in keys:
+        value = _float_or_none(info.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _jsonable(fields: dict) -> dict:
@@ -120,11 +132,15 @@ class DerivEngine(BaseEngine):
                     "currency": "USD",
                     "duration": duration,
                     "duration_unit": duration_unit,
-                    "underlying_symbol": symbol
+                    "underlying_symbol": symbol,
+                    "req_id": PROPOSAL_REQ_ID,
                 }
                 await asyncio.wait_for(ws.send(json.dumps(proposal_req)), WS_TIMEOUT)
                 response = json.loads(await asyncio.wait_for(ws.recv(), WS_TIMEOUT))
 
+                # Nothing has been bought yet, so an unmatched reply only ends this attempt.
+                if response.get('req_id') != PROPOSAL_REQ_ID or response.get('msg_type') != 'proposal':
+                    raise ValueError(f"reply not identifiable as the proposal response: {str(response)[:300]}")
                 if 'error' in response:
                     logger.error(f"Deriv Proposal Error: {response['error']}")
                     return None
@@ -138,22 +154,28 @@ class DerivEngine(BaseEngine):
                 # 3. Buy Contract. From here on a contract may exist.
                 buy_req = {
                     "buy": proposal_id,
-                    "price": quantity
+                    "price": quantity,
+                    "req_id": BUY_REQ_ID,
                 }
                 buy_sent = True
                 await asyncio.wait_for(ws.send(json.dumps(buy_req)), WS_TIMEOUT)
                 buy_response = json.loads(await asyncio.wait_for(ws.recv(), WS_TIMEOUT))
 
+                # Only a reply that identifies itself as the answer to this buy
+                # (its req_id, msg_type buy, this proposal echoed back) says
+                # anything about the buy. Anything else leaves the outcome unknown;
+                # a contract ID it carries is kept so the contract can be recorded.
+                is_buy_reply = (
+                    buy_response.get('req_id') == BUY_REQ_ID
+                    and buy_response.get('msg_type') == 'buy'
+                    and (buy_response.get('echo_req') or {}).get('buy') == proposal_id
+                )
+                if not is_buy_reply:
+                    receipt = buy_response.get('buy')
+                    if isinstance(receipt, dict):
+                        contract_id = receipt.get('contract_id')
+                    raise ValueError(f"reply not identifiable as the buy response: {str(buy_response)[:300]}")
                 if 'error' in buy_response:
-                    # Only an error that identifies itself as the reply to this buy
-                    # proves nothing was bought. Any other error says nothing about
-                    # the buy, so its outcome is unknown.
-                    is_buy_reply = (
-                        buy_response.get('msg_type') == 'buy'
-                        and (buy_response.get('echo_req') or {}).get('buy') == proposal_id
-                    )
-                    if not is_buy_reply:
-                        raise ValueError(f"error reply not identifiable as the buy response: {str(buy_response)[:300]}")
                     logger.error(f"Deriv Buy Error: {buy_response['error']}")
                     return None
 
@@ -422,15 +444,22 @@ class DerivEngine(BaseEngine):
     def get_account_summary(self) -> dict:
         return {"balance": 0.0}
 
-    async def _reconcile_contract(self, ws, contract_id: str):
+    async def _reconcile_contract(self, ws, contract_id: str, req_id: int):
         req = {
             "proposal_open_contract": 1,
-            "contract_id": int(contract_id)
+            "contract_id": int(contract_id),
+            "req_id": req_id,
         }
         await asyncio.wait_for(ws.send(json.dumps(req)), WS_TIMEOUT)
         resp = json.loads(await asyncio.wait_for(ws.recv(), WS_TIMEOUT))
+        if resp.get("req_id") != req_id:
+            logger.error(f"Reconciliation reply with req_id {resp.get('req_id')} while waiting for {req_id}; leaving contract {contract_id} OPEN")
+            return None
+        if "error" in resp:
+            logger.error(f"Reconciliation error for contract {contract_id}: {resp['error']}")
+            return None
         info = resp.get("proposal_open_contract")
-        # Replies are matched by order; never settle a trade from another contract's reply.
+        # Matched by req_id above and by contract ID here: never settle a trade from another contract's reply.
         if info and str(info.get("contract_id")) != str(contract_id):
             logger.error(f"Reconciliation reply for contract {info.get('contract_id')} while asking about {contract_id}; skipping")
             return None
@@ -490,24 +519,32 @@ class DerivEngine(BaseEngine):
             async def run_recon():
                 async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT, close_timeout=5) as ws:
                     from datetime import datetime, timezone
-                    for trade in open_trades:
+                    for req_id, trade in enumerate(open_trades, start=1000):
                         if not trade.contract_id:
                             continue
-                        contract_info = await self._reconcile_contract(ws, trade.contract_id)
+                        contract_info = await self._reconcile_contract(ws, trade.contract_id, req_id)
                         if not contract_info:
                             continue
 
                         # is_sold == 1 or status in ('won', 'lost') means it's closed
                         if contract_info.get('is_sold') == 1 or contract_info.get('status') in ('won', 'lost'):
+                            profit = _float_or_none(contract_info.get('profit'))
+                            if profit is None:
+                                logger.error(f"Contract {trade.contract_id} settled without a profit figure; leaving it OPEN")
+                                continue
                             status_str = contract_info.get('status', 'unknown')
                             trade.status = "CLOSED"
                             trade.result = status_str.upper()
-                            trade.payout = float(contract_info.get('sell_price', 0) or contract_info.get('payout', 0))
-                            trade.pnl = float(contract_info.get('profit', 0))
+                            # payout is what the contract pays on a win, the same won or
+                            # lost; what it settled for is sell_price, the result is pnl.
+                            trade.payout = _float_or_none(contract_info.get('payout')) or trade.payout
+                            trade.pnl = profit
                             trade.sell_price = _float_or_none(contract_info.get('sell_price'))
-                            trade.exit_spot = _float_or_none(contract_info.get('exit_tick') or contract_info.get('sell_spot'))
-                            if trade.entry_spot is None:
-                                trade.entry_spot = _float_or_none(contract_info.get('entry_spot'))
+                            # The Options API reports entry_spot/exit_spot; entry_tick,
+                            # exit_tick and sell_spot are the older v3 names. Deriv's
+                            # entry spot replaces the proposal-time spot stored at buy.
+                            trade.exit_spot = _first_float(contract_info, 'exit_spot', 'exit_tick', 'sell_spot')
+                            trade.entry_spot = _first_float(contract_info, 'entry_spot', 'entry_tick') or trade.entry_spot
                             trade.closed_timestamp = datetime.now(timezone.utc)
                             logger.info(f"Reconciled contract {trade.contract_id}: {trade.result} | PnL: {trade.pnl}")
 
