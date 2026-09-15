@@ -5,6 +5,8 @@ Exits non-zero with one line per problem when:
 - DATABASE_URL is SQLite and MACS_ALLOW_SQLITE is not "1" (a container's
   SQLite file is lost on every redeploy, and with it the trade history the
   risk manager reads its loss limits from),
+- DATABASE_URL uses Supabase's transaction pooler (port 6543), which can't
+  hold the single-instance trading lock,
 - the database cannot be reached,
 - the schema is not at the Alembic head revision.
 
@@ -20,6 +22,7 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import make_url
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 REQUIRED_ENV = ("DERIV_API_TOKEN", "DERIV_APP_ID")
@@ -36,6 +39,13 @@ def check(db_url: str, environ) -> list:
 
     if db_url.startswith("sqlite") and environ.get("MACS_ALLOW_SQLITE") != "1":
         problems.append("DATABASE_URL is SQLite; set a Postgres URL, or MACS_ALLOW_SQLITE=1 for local development")
+        return problems
+
+    if db_url.startswith("postgresql") and make_url(db_url).port == 6543:
+        problems.append(
+            "DATABASE_URL uses the transaction pooler (port 6543), which cannot hold the trading lock; "
+            "use the session pooler on port 5432"
+        )
         return problems
 
     connect_args = {"connect_timeout": 10} if db_url.startswith("postgresql") else {}

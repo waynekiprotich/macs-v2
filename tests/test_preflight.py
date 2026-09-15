@@ -48,3 +48,11 @@ def test_unreachable_postgres_fails_without_leaking_the_password():
     problems = check(url, ENV)
     assert len(problems) == 1 and problems[0].startswith("cannot connect to the database")
     assert "s3cret-pw" not in problems[0]
+
+
+def test_transaction_pooler_is_refused_before_connecting():
+    url = URL.create(
+        "postgresql", username="macs", password="s3cret-pw", host="pooler.example", port=6543, database="postgres",
+    ).render_as_string(hide_password=False)
+    problems = check(url, ENV)
+    assert len(problems) == 1 and "6543" in problems[0]
