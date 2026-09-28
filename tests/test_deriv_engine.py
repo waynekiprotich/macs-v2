@@ -75,13 +75,15 @@ class FakeDeriv:
 
 
 @pytest.fixture
-def deriv(monkeypatch, clean_trading_tables):
+def deriv(monkeypatch, clean_trading_tables, legacy_execution_config):
     http_calls = []
+    monkeypatch.setattr(DerivEngine, "get_account_summary", lambda self: {"balance": 68000.0})
+    monkeypatch.setattr(deriv_engine, "_now", lambda: CANDLE + timedelta(minutes=15, seconds=10))
 
     def install(buy_reply):
         fake = FakeDeriv(buy_reply)
         otp = MagicMock(status_code=200)
-        otp.json.return_value = {"data": {"url": "wss://fake"}}
+        otp.json.return_value = {"data": {"url": "wss://api.derivws.com/trading/v1/options/ws/demo?otp=fake"}}
 
         def post(*args, **kwargs):
             http_calls.append(kwargs)
@@ -229,7 +231,7 @@ def test_no_buy_when_the_intent_cannot_be_recorded(deriv, monkeypatch):
 
     result = _buy()
 
-    assert result["status"] == "error"
+    assert result["status"] == "blocked"
     assert fake.sent == [] and fake.http_calls == []
 
 
@@ -319,6 +321,7 @@ def _pipeline_always_buys(monkeypatch):
     )
     last_close = (candles.index[-1] + pd.Timedelta(minutes=15)).tz_localize("UTC").to_pydatetime()
     monkeypatch.setattr(pipeline_module, "_now", lambda: last_close + timedelta(seconds=10))
+    monkeypatch.setattr(deriv_engine, "_now", lambda: last_close + timedelta(seconds=10))
     monkeypatch.setattr(pipeline_module, "_sleep", lambda seconds: None)
     monkeypatch.setattr(pipeline_module.DerivDataProvider, "fetch_data", lambda self, symbol: candles)
     monkeypatch.setattr(DerivEngine, "reconcile_open_contracts", lambda self: None)

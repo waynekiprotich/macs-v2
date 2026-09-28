@@ -1,10 +1,12 @@
 import datetime
 import logging
+import math
 from typing import Dict, Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models.database import SessionLocal, PaperTrade, RiskEvent, TradeIntent, UNRESOLVED_INTENT_STATUSES
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +38,11 @@ class RiskManager:
 
     def __init__(self, db_path: str = "trading.db"):
         self.db_path = db_path # Kept for signature compatibility if needed, but not used.
-        self.max_daily_loss = -500.0
-        self.cooldown_hours = 4
-        self.consecutive_loss_limit = 3
+        self.max_daily_loss = -settings.MACS_MAX_DAILY_LOSS
+        self.cooldown_hours = settings.MACS_COOLDOWN_HOURS
+        self.consecutive_loss_limit = settings.MACS_MAX_CONSECUTIVE_LOSSES
+        self.open_count = 0
+        self.open_exposure = 0.0
 
         # None until read from the database: unknown is not the same as zero.
         self.daily_pnl = None
@@ -75,16 +79,24 @@ class RiskManager:
             now = datetime.datetime.now(datetime.timezone.utc)
             today_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=datetime.timezone.utc)
 
-            # Daily PNL
+            # SUM ignores NULL: a missing settlement must never become zero risk.
+            closed_pnls = db.query(PaperTrade.pnl).filter(PaperTrade.status == 'CLOSED').all()
+            if any(pnl is None or not math.isfinite(pnl) for (pnl,) in closed_pnls):
+                raise ValueError("Closed trade has missing or non-finite P&L; reconcile before trading")
+
+            # Prefer actual/derived settlement time to entry time at midnight.
+            settled_at = func.coalesce(PaperTrade.expiry_time, PaperTrade.closed_timestamp, PaperTrade.timestamp)
             daily_pnl = db.query(func.sum(PaperTrade.pnl)).filter(
-                PaperTrade.timestamp >= today_start,
+                settled_at >= today_start,
                 PaperTrade.status == 'CLOSED'
             ).scalar() or 0.0
+            if not math.isfinite(daily_pnl):
+                raise ValueError("Daily P&L is not finite")
 
             # Consecutive losses
             recent_trades = db.query(PaperTrade).filter(
                 PaperTrade.status == 'CLOSED'
-            ).order_by(PaperTrade.timestamp.desc()).limit(self.consecutive_loss_limit).all()
+            ).order_by(settled_at.desc(), PaperTrade.id.desc()).limit(self.consecutive_loss_limit).all()
 
             losses = 0
             latest_loss_time = None
@@ -92,7 +104,7 @@ class RiskManager:
                 if trade.pnl is not None and trade.pnl < 0:
                     losses += 1
                     if latest_loss_time is None:
-                        latest_loss_time = trade.timestamp
+                        latest_loss_time = trade.expiry_time or trade.closed_timestamp or trade.timestamp
                 else:
                     break
 
@@ -104,11 +116,16 @@ class RiskManager:
                 TradeIntent.status.in_(UNRESOLVED_INTENT_STATUSES)
             ).all()]
 
+            open_trades = db.query(PaperTrade).filter(PaperTrade.status == 'OPEN').all()
+            if any(not math.isfinite(t.price) or t.price <= 0 for t in open_trades):
+                raise ValueError("Open exposure contains an invalid stake")
             overdue = [
                 trade.contract_id or f"trade {trade.id}"
-                for trade in db.query(PaperTrade).filter(PaperTrade.status == 'OPEN').all()
+                for trade in open_trades
                 if _is_due(trade, now, self.EXPIRY_MARGIN)
             ]
+            open_exposure = sum(t.price for t in open_trades)
+            open_count = len(open_trades)
         finally:
             db.close()
 
@@ -117,6 +134,8 @@ class RiskManager:
         self.cooldown_until = cooldown_until
         self.unresolved_intents = unresolved
         self.overdue_contracts = overdue
+        self.open_exposure = open_exposure
+        self.open_count = open_count
         logger.info(
             f"Risk state loaded via SQLAlchemy. Daily PnL: {self.daily_pnl}, Consecutive Losses: {self.consecutive_losses}, "
             f"Unresolved trade intents: {len(unresolved)}, Overdue open contracts: {len(overdue)}"
@@ -167,6 +186,65 @@ class RiskManager:
             "allowed": True,
             "reason": "Risk checks passed"
         }
+
+    def check_order(self, stake: float, balance: float, symbol: str, side: str,
+                    candle_time, cooldown_bars: int = 0, own_intent_id=None) -> Dict[str, Any]:
+        """Budget the worst-case loss before sending a buy, including open stakes.
+
+        Balance is available cash from the demo broker, not an invented equity.
+        Limits use current cash conservatively and a fixed currency ceiling.
+        The caller holds the process/database trading lock.
+        """
+        unresolved = self.unresolved_intents
+        try:
+            self.unresolved_intents = [i for i in unresolved if i != own_intent_id]
+            status = self.can_trade()
+        finally:
+            self.unresolved_intents = unresolved
+        if not status["allowed"]:
+            return status
+        reason = None
+        if not all(math.isfinite(v) and v > 0 for v in (stake, balance)):
+            reason = "Invalid stake or demo balance"
+        elif stake < settings.MACS_MIN_STAKE:
+            reason = "Proposed stake is below the configured minimum"
+        elif stake > min(balance * settings.MACS_RISK_PER_TRADE, settings.MACS_MAX_STAKE) + 1e-8:
+            reason = "Proposed stake exceeds the per-trade risk budget"
+        elif self.open_count >= settings.MACS_MAX_OPEN_TRADES:
+            reason = "Maximum open contracts reached"
+        elif self.open_exposure + stake > balance * settings.MACS_MAX_OPEN_EXPOSURE + 1e-8:
+            reason = "Proposed order exceeds total open exposure budget"
+        elif self.daily_pnl - self.open_exposure - stake < -min(
+            settings.MACS_MAX_DAILY_LOSS, balance * settings.MACS_DAILY_LOSS_FRACTION
+        ) - 1e-8:
+            reason = "Proposed order could exceed the daily loss budget"
+        if reason is None and cooldown_bars:
+            db = SessionLocal()
+            try:
+                last = db.query(func.max(TradeIntent.candle_time)).filter(
+                    TradeIntent.symbol == symbol, TradeIntent.side == side,
+                    TradeIntent.status == "EXECUTED",
+                ).scalar()
+                if last is not None and _as_utc(candle_time) <= _as_utc(last) + datetime.timedelta(minutes=15 * cooldown_bars):
+                    reason = "Same-direction candle cooldown active"
+            except Exception:
+                reason = "Could not verify the candle cooldown"
+            finally:
+                db.close()
+        return {"allowed": reason is None, "reason": reason or "Order risk checks passed"}
+
+    def record_order_block(self, reason: str, symbol: str, signal_id=None) -> None:
+        db = SessionLocal()
+        try:
+            db.add(RiskEvent(event_type="ORDER_BLOCKED", severity="WARN", symbol=symbol,
+                             signal_id=signal_id, daily_pnl=self.daily_pnl, message=reason,
+                             details={"open_exposure": self.open_exposure, "open_count": self.open_count}))
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.error("Could not record order risk block")
+        finally:
+            db.close()
 
     def record_block(self) -> None:
         """Write a risk_events row when a block starts, not on every cycle it

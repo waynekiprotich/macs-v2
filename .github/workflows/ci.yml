@@ -1,0 +1,36 @@
+name: Tests and builds
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production worker
+        run: docker build -t macs-worker .
+      - name: Run isolated regression tests inside worker image
+        run: >-
+          docker run --rm --entrypoint /bin/sh
+          -v "$PWD/tests:/app/tests:ro"
+          macs-worker -c
+          'pip install --user pytest -c constraints.txt && python -m pytest -q'
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build

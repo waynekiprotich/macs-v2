@@ -11,11 +11,14 @@ class Signal(BaseModel):
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     reasoning: str
     timestamp: Optional[datetime] = None
+    agreement_score: float = Field(default=0, ge=0, le=100)
+    action_taken: Optional[str] = None
+    price: Optional[float] = None
 
 class Risk(BaseModel):
     symbol: str
     risk_level: str
-    max_position_size: float
+    max_position_size: Optional[float] = None
     stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
     warnings: List[str] = []

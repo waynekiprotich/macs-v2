@@ -27,6 +27,16 @@ def test_readable_clean_state_allows_trading():
     assert RiskManager().can_trade()["allowed"]
 
 
+@pytest.mark.parametrize('pnl', [None, float('nan'), float('inf'), -float('inf')])
+def test_invalid_closed_pnl_blocks_even_outside_today(pnl):
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    _add(PaperTrade(symbol='TEST_RISK', side='BUY', quantity=25, price=25,
+                    status='CLOSED', pnl=pnl, timestamp=yesterday, expiry_time=yesterday))
+    manager = RiskManager()
+    assert not manager.can_trade()['allowed']
+    assert 'P&L' in manager.load_error
+
+
 def test_database_error_blocks_trading_instead_of_assuming_a_clean_account(monkeypatch):
     monkeypatch.setattr(risk_management, "SessionLocal", _db_down)
 

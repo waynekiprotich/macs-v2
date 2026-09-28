@@ -44,7 +44,7 @@ class FakeEngine:
 
 
 @pytest.fixture
-def run_pipeline(monkeypatch, clean_trading_tables):
+def run_pipeline(monkeypatch, clean_trading_tables, legacy_execution_config):
     candles = _candles()
     monkeypatch.setattr(pipeline_module.DerivDataProvider, "fetch_data", lambda self, symbol: candles)
     monkeypatch.setattr("execution.deriv_engine.DerivEngine", FakeEngine)

@@ -5,25 +5,25 @@ export default function PerformanceCards({ performance, positions, trades }) {
   const cards = [
     {
       title: "Total P&L",
-      value: `$${performance?.pnl?.toLocaleString(undefined, {minimumFractionDigits: 2}) || '0.00'}`,
+      value: performance ? `$${performance.pnl.toLocaleString(undefined, {minimumFractionDigits: 2})}` : 'Unavailable',
       icon: <DollarSign className="text-green-500" size={24} />,
       color: performance?.pnl >= 0 ? "text-green-400" : "text-red-400"
     },
     {
       title: "Win Rate",
-      value: `${performance?.winRate?.toFixed(1) || 0}%`,
+      value: performance ? `${performance.winRate.toFixed(1)}%` : 'Unavailable',
       icon: <Percent className="text-blue-500" size={24} />,
       color: "text-white"
     },
     {
       title: "Active Positions",
-      value: positions?.length || performance?.activePositions || 0,
+      value: positions?.length ?? 'Unavailable',
       icon: <Briefcase className="text-purple-500" size={24} />,
       color: "text-white"
     },
     {
-      title: "Total Trades",
-      value: trades?.length || performance?.totalTrades || 0,
+      title: "Settled Trades",
+      value: performance?.totalTrades ?? 'Unavailable',
       icon: <Activity className="text-orange-500" size={24} />,
       color: "text-white"
     }
