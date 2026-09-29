@@ -16,6 +16,8 @@ from .instance_lock import trading_lock
 from .regime import detect_regime
 from .risk_management import RiskManager
 from . import technical_strategy
+from .experiment import market_rule, hourly_trend, signal_filter, experiment_config, config_fingerprint
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ EXECUTION_ACTIONS = {
     "success": "EXECUTED",
     "duplicate": "DUPLICATE_SKIPPED",
     "reconciliation_required": "RECONCILIATION_REQUIRED",
+    "blocked": "POLICY_BLOCKED",
 }
 
 
@@ -148,7 +151,7 @@ class TradingPipeline:
         if not risk_status['allowed']:
             logger.warning(f"Trading blocked by risk manager: {risk_status['reason']}")
             self.risk_manager.record_block()
-            return self._blocked(risk_status['reason'])
+            # Continue recording market observations while execution is blocked.
 
         for symbol in self.symbols:
             logger.info(f"Processing symbol: {symbol}")
@@ -160,17 +163,19 @@ class TradingPipeline:
                 outcomes[symbol] = {"action": "NO DATA", "confidence": 0, "reason": "No closed candles returned from Deriv"}
                 continue
 
+            hourly = hourly_trend(df)
             df = compute_indicators(df)
             df = detect_regime(df)
             df = technical_strategy.prepare(df)
+            df['Hourly_Trend'] = hourly.reindex(df.index)
 
             if df.empty:
                 continue
 
             self._store_snapshots(symbol, df)
 
-            from config.settings import settings
-            min_conditions = getattr(settings, 'MACS_MIN_CONDITIONS', 6)
+            rule = market_rule(symbol)
+            min_conditions = rule.min_conditions
 
             latest = df.iloc[-1].copy()
             is_volatile = bool(latest.get('Is_Volatile', False))
@@ -194,12 +199,34 @@ class TradingPipeline:
                 "reason": eval_result['reason'],
             }
 
+            if not rule.enabled:
+                outcomes[symbol]['action'] = 'OBSERVATION_ONLY'
+                outcomes[symbol]['reason'] = 'Collecting data; index is not approved for this experiment'
+                self._set_action_taken(signal_id, 'OBSERVATION_ONLY')
+                continue
+            if not risk_status['allowed']:
+                outcomes[symbol]['action'] = 'BLOCKED'
+                outcomes[symbol]['reason'] = risk_status['reason']
+                self._set_action_taken(signal_id, 'RISK_BLOCKED', risk_status['reason'])
+                continue
+
             if signal in ('BUY', 'SELL'):
                 if signal_id is None:
                     # No signals row: the trade could be neither audited nor linked.
                     logger.error(f"Trade blocked for {symbol}: the signal could not be recorded")
                     outcomes[symbol]["action"] = "HOLD"
                     outcomes[symbol]["reason"] = "Signal not recorded; trade blocked"
+                    continue
+                blocked = signal_filter(rule, signal, latest.get('Hourly_Trend', 'unknown'))
+                if blocked:
+                    outcomes[symbol]['action'] = blocked
+                    outcomes[symbol]['reason'] = blocked.replace('_', ' ').lower()
+                    self._set_action_taken(signal_id, blocked)
+                    continue
+                if not settings.MACS_EXECUTION_ENABLED or settings.MACS_MODE != 'PAPER':
+                    outcomes[symbol]['action'] = 'OBSERVATION_ONLY'
+                    outcomes[symbol]['reason'] = 'Demo execution disabled; candidate signal recorded'
+                    self._set_action_taken(signal_id, 'OBSERVATION_ONLY')
                     continue
                 signal_age = (_now() - _utc(latest.name)).total_seconds() - GRANULARITY_SECONDS
                 if signal_age > MAX_SIGNAL_AGE_SECONDS:
@@ -221,6 +248,7 @@ class TradingPipeline:
                         action_taken = EXECUTION_ACTIONS.get(res.get("status"), "EXECUTION_FAILED")
                         if action_taken != "EXECUTED":
                             outcomes[symbol]["action"] = action_taken
+                            outcomes[symbol]["reason"] = res.get('message', action_taken)
                     else:
                         logger.info(f"[DRY RUN] Would execute {signal} for {symbol} at {latest.get('Close', 0):.2f}")
                         action_taken = "DRY_RUN"
@@ -232,7 +260,7 @@ class TradingPipeline:
                     action_taken = "RISK_BLOCKED"
             else:
                 action_taken = "VOLATILITY_SKIP" if is_volatile else "HOLD"
-            self._set_action_taken(signal_id, action_taken)
+            self._set_action_taken(signal_id, action_taken, outcomes[symbol]['reason'])
             if action_taken == "RECONCILIATION_REQUIRED":
                 logger.critical("Halting this cycle: a Deriv contract needs reconciliation before any further trade.")
                 break
@@ -296,7 +324,8 @@ class TradingPipeline:
                 stop_loss=_json_safe(eval_result.get('stop_loss')),
                 reason=eval_result.get('reason'),
                 strategy="technical_strategy",
-                indicators=_indicator_snapshot(latest),
+                indicators={**_indicator_snapshot(latest), 'experiment': experiment_config(),
+                            'config_fingerprint': config_fingerprint()},
             )
             db.add(row)
             db.commit()
@@ -308,12 +337,15 @@ class TradingPipeline:
         finally:
             db.close()
 
-    def _set_action_taken(self, signal_id: Optional[int], action_taken: str) -> None:
+    def _set_action_taken(self, signal_id: Optional[int], action_taken: str, reason: str = None) -> None:
         if signal_id is None:
             return
         db = SessionLocal()
         try:
-            db.query(SystemLog).filter(SystemLog.id == signal_id).update({"action_taken": action_taken})
+            fields = {"action_taken": action_taken}
+            if reason is not None:
+                fields['reason'] = reason
+            db.query(SystemLog).filter(SystemLog.id == signal_id).update(fields)
             db.commit()
         except Exception as e:
             logger.error(f"Failed to record action for signal {signal_id}: {e}")
@@ -329,12 +361,12 @@ class TradingPipeline:
 
         confidence = data_row.get('Confidence', 0.0)
         regime = data_row.get('Regime', 'unknown')
-        reason = f"TechConfidence:{confidence:.1f} (pure technical, no AI)"
+        reason = f"Indicator agreement:{confidence:.1f}% (not a win probability)"
 
         res = engine.execute_signal(
             symbol=symbol,
             signal=action,
-            quantity=170.0, # Stake $170
+            quantity=None,  # Sized from the authenticated demo balance before buying.
             price=data_row.get('Close', 0.0),
             reason=reason,
             tech_score=confidence,

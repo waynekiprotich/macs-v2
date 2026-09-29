@@ -2,7 +2,10 @@ import React from 'react';
 import { ArrowUpRight, ArrowDownRight } from 'lucide-react';
 
 export default function TradeHistory({ trades }) {
-  if (!trades || trades.length === 0) {
+  if (!trades) {
+    return <div className="text-gray-400 py-4 text-center">Trade history unavailable</div>;
+  }
+  if (trades.length === 0) {
     return <div className="text-gray-400 py-4 text-center">No trade history available</div>;
   }
 
@@ -13,8 +16,8 @@ export default function TradeHistory({ trades }) {
           <tr className="border-b border-githubBorder text-gray-400 text-sm">
             <th className="pb-2 font-medium">Symbol</th>
             <th className="pb-2 font-medium">Type</th>
-            <th className="pb-2 font-medium">Price</th>
-            <th className="pb-2 font-medium">Size</th>
+            <th className="pb-2 font-medium">Stake</th>
+            <th className="pb-2 font-medium">Status</th>
             <th className="pb-2 font-medium">P&L</th>
             <th className="pb-2 font-medium">Date</th>
           </tr>
@@ -28,18 +31,18 @@ export default function TradeHistory({ trades }) {
                 <td className="py-3 font-semibold text-white">{trade.symbol || 'N/A'}</td>
                 <td className="py-3">
                   <span className={`flex items-center text-xs font-medium ${
-                    trade.type === 'LONG' ? 'text-green-400' : 'text-red-400'
+                    trade.side === 'BUY' ? 'text-green-400' : 'text-red-400'
                   }`}>
-                    {trade.type === 'LONG' ? <ArrowUpRight size={14} className="mr-1" /> : <ArrowDownRight size={14} className="mr-1" />}
-                    {trade.type || '-'}
+                    {trade.side === 'BUY' ? <ArrowUpRight size={14} className="mr-1" /> : <ArrowDownRight size={14} className="mr-1" />}
+                    {trade.side || '-'}
                   </span>
                 </td>
                 <td className="py-3 text-gray-300">${trade.price?.toFixed(2) || '0.00'}</td>
-                <td className="py-3 text-gray-300">{trade.size || 0}</td>
+                <td className="py-3 text-gray-300">{trade.status || 'Unknown'}</td>
                 <td className={`py-3 font-medium ${
                   isProfit ? 'text-green-400' : isLoss ? 'text-red-400' : 'text-gray-400'
                 }`}>
-                  {isProfit ? '+' : ''}{trade.pnl?.toFixed(2) || '0.00'}
+                  {isProfit ? '+' : ''}{trade.pnl == null ? 'Pending' : trade.pnl.toFixed(2)}
                 </td>
                 <td className="py-3 text-sm text-gray-500">
                   {trade.timestamp ? new Date(trade.timestamp).toLocaleDateString() : '-'}

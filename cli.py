@@ -25,14 +25,15 @@ def cli():
 
 
 @cli.command()
-@click.option("--symbols", "-s", default=",".join(SYMBOLS), help="Comma-separated symbols")
+@click.option("--symbols", "-s", default=None, help="Symbols to scan; cannot override the trading allowlist")
 @click.option("--no-ai", is_flag=True, help="Skip AI analysis")
 @click.option("--dry-run", is_flag=True, help="Don't execute trades")
 def analyze(symbols, no_ai, dry_run):
     """Run MACS pipeline once."""
     from core.pipeline import TradingPipeline
 
-    symbol_list = [s.strip() for s in symbols.split(",")]
+    from config.settings import settings
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(settings.MACS_MARKET_RULES)
     pipeline = TradingPipeline(symbol_list)
 
     console.print(f"[bold cyan]MACS Analyze[/] — {symbol_list}")
@@ -73,7 +74,7 @@ def analyze(symbols, no_ai, dry_run):
     table = Table(title="MACS Signals")
     table.add_column("Symbol", style="cyan")
     table.add_column("Action", style="bold")
-    table.add_column("Confidence")
+    table.add_column("Agreement (not probability)")
     table.add_column("TP / SL")
     table.add_column("Reason")
 
@@ -537,14 +538,15 @@ def serve(host, port):
 
 
 @cli.command()
-@click.option("--symbols", "-s", default=",".join(SYMBOLS), help="Comma-separated symbols")
+@click.option("--symbols", "-s", default=None, help="Symbols to scan; cannot override the trading allowlist")
 @click.option("--interval", default=15, help="Minutes between pipeline runs")
 def run(symbols, interval):
     """Run MACS continuously (scheduler mode)."""
     from core.pipeline import TradingPipeline
     from core.scheduler import TradingScheduler
 
-    symbol_list = [s.strip() for s in symbols.split(",")]
+    from config.settings import settings
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else list(settings.MACS_MARKET_RULES)
     pipeline = TradingPipeline(symbol_list)
     scheduler = TradingScheduler(pipeline, interval_minutes=interval)
     console.print(f"[bold cyan]MACS Scheduler[/] — {symbol_list} every {interval}m")
@@ -553,6 +555,13 @@ def run(symbols, interval):
     except KeyboardInterrupt:
         scheduler.stop()
         console.print("[yellow]MACS stopped by user[/]")
+
+
+@cli.command(name="experiment-config")
+def show_experiment_config():
+    """Show the effective non-secret configuration without contacting the broker."""
+    from core.experiment import experiment_config, config_fingerprint
+    console.print_json(data={**experiment_config(), "config_fingerprint": config_fingerprint()})
 
 
 if __name__ == "__main__":

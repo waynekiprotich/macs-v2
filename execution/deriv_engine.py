@@ -4,12 +4,17 @@ import asyncio
 import requests
 import websockets
 import logging
+import math
+import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.exc import IntegrityError
 from config.settings import settings
 from execution.base import BaseEngine
 from models.database import SessionLocal, PaperTrade, TradeIntent
 from core.notifications import send_discord_signal, send_heartbeat
+from core.experiment import market_rule, stake_for_balance, config_fingerprint
+from core.risk_management import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,22 @@ WS_TIMEOUT = 15
 # reply, which is how a reply is tied to the request it answers.
 PROPOSAL_REQ_ID = 1
 BUY_REQ_ID = 2
+
+
+class OrderBlocked(Exception):
+    """A pre-purchase policy rejection; no contract was bought."""
+
+
+def _demo_url(url: str) -> str:
+    parsed = urlparse(url)
+    if (parsed.scheme != "wss" or parsed.hostname != "api.derivws.com"
+            or parsed.path != "/trading/v1/options/ws/demo"):
+        raise OrderBlocked("The broker did not return the approved demo WebSocket endpoint")
+    return url
+
+
+def _now():
+    return datetime.now(timezone.utc)
 
 
 class AmbiguousBuyError(Exception):
@@ -49,7 +70,8 @@ def _duration_delta(amount: int, unit: str) -> timedelta:
 
 def _float_or_none(value):
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -94,6 +116,7 @@ class DerivEngine(BaseEngine):
         self.token = os.environ.get('DERIV_API_TOKEN')
         self.app_id = os.environ.get('DERIV_APP_ID')
         self.account_id = "DOT90734760"
+        self._order_context = None
 
     async def _execute_contract(self, symbol: str, signal: str, quantity: float):
         """Buy one contract. Returns the buy details, or None when Deriv
@@ -116,12 +139,13 @@ class DerivEngine(BaseEngine):
                 headers=headers, timeout=HTTP_TIMEOUT,
             )
             resp.raise_for_status()
-            ws_url = resp.json()['data']['url']
+            ws_url = _demo_url(resp.json()['data']['url'])
 
             async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT, close_timeout=5) as ws:
                 contract_type = "CALL" if signal.upper() == "BUY" else "PUT"
-                duration = settings.MACS_CONTRACT_DURATION
-                duration_unit = settings.MACS_CONTRACT_DURATION_UNIT
+                rule = market_rule(symbol)
+                duration = rule.duration_minutes
+                duration_unit = "m"
 
                 # 2. Get Proposal
                 proposal_req = {
@@ -150,6 +174,32 @@ class DerivEngine(BaseEngine):
                 payout = proposal['payout']
                 entry_spot = proposal.get('spot')
                 logger.info(f"Deriv Proposal ID: {proposal_id}, Payout: {payout}")
+
+                quote = _float_or_none(payout)
+                ask = _float_or_none(proposal.get('ask_price', quantity))
+                if (quote is None or ask is None or not math.isfinite(quote)
+                        or not math.isfinite(ask) or ask <= 0 or ask > quantity + 1e-8):
+                    raise OrderBlocked("Invalid or over-budget proposal")
+                # Use the maximum payable stake, even if ask_price is discounted.
+                net_payout = (quote - quantity) / quantity
+                if net_payout + 1e-10 < rule.min_payout:
+                    raise OrderBlocked(f"Payout {net_payout:.2%} below required {rule.min_payout:.2%}")
+                context = self._order_context
+                if context is None:
+                    raise OrderBlocked("Missing audited order context")
+                age = (_now() - context['candle_time']).total_seconds() - 900
+                if age < 0 or age > 120 or time.monotonic() - context['balance_at'] > 30:
+                    raise OrderBlocked("Signal or balance became stale before purchase")
+                risk = RiskManager()
+                check = risk.check_order(quantity, context['balance'], symbol, signal.upper(),
+                                         context['candle_time'], rule.cooldown_bars, context['intent_id'])
+                if not check['allowed']:
+                    raise OrderBlocked(check['reason'])
+                # The risk database can be slow; check time again immediately
+                # before sending the irreversible request.
+                age = (_now() - context['candle_time']).total_seconds() - 900
+                if age < 0 or age > 120 or time.monotonic() - context['balance_at'] > 30:
+                    raise OrderBlocked("Signal or balance became stale during risk checks")
 
                 # 3. Buy Contract. From here on a contract may exist.
                 buy_req = {
@@ -228,7 +278,7 @@ class DerivEngine(BaseEngine):
             raise
         return result
 
-    def execute_signal(self, symbol: str, signal: str, quantity: float, price: float, reason: str = "",
+    def execute_signal(self, symbol: str, signal: str, quantity: float | None, price: float, reason: str = "",
                        tech_score: float = None, ai_score: float = None, confidence: float = None, regime: str = None,
                        signal_id: int = None, candle_time: datetime = None) -> dict:
         """
@@ -244,19 +294,51 @@ class DerivEngine(BaseEngine):
         side = signal.upper()
         if side not in ('BUY', 'SELL'):
             return {"status": "ignored"}
+        rule = market_rule(symbol)
+        if not settings.MACS_EXECUTION_ENABLED or settings.MACS_MODE != "PAPER":
+            return {"status": "blocked", "message": "Demo execution is disabled"}
+        if not rule.enabled or side not in rule.directions:
+            return {"status": "blocked", "message": "Market or direction is observation-only"}
         if candle_time is None:
             logger.error(f"Refusing to trade {symbol}: no candle time to key the trade intent on")
             return {"status": "error", "message": "missing candle_time"}
+
+        candle_time = candle_time.replace(tzinfo=timezone.utc) if candle_time.tzinfo is None else candle_time.astimezone(timezone.utc)
+        try:
+            db = SessionLocal()
+            try:
+                existing = db.query(TradeIntent.id).filter_by(symbol=symbol, side=side, candle_time=candle_time).first()
+                if existing:
+                    return {"status": "duplicate", "intent_id": existing.id}
+            finally:
+                db.close()
+            account = self.get_account_summary()
+            balance_at = time.monotonic()
+            balance = account['balance']
+            approved_stake = stake_for_balance(balance)
+            quantity = approved_stake if quantity is None else quantity
+            risk = RiskManager()
+            check = risk.check_order(quantity, balance, symbol, side, candle_time, rule.cooldown_bars)
+            if not check['allowed']:
+                risk.record_order_block(check['reason'], symbol, signal_id)
+                return {"status": "blocked", "message": check['reason']}
+        except Exception as e:
+            return {"status": "blocked", "message": f"Sizing unavailable: {type(e).__name__}"}
 
         claim = self._claim_intent(symbol, side, candle_time, quantity, signal_id)
         if claim["status"] != "claimed":
             return claim
         intent_id = claim["intent_id"]
+        self._order_context = dict(balance=balance, balance_at=balance_at, candle_time=candle_time, intent_id=intent_id)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             result = loop.run_until_complete(self._execute_contract(symbol, signal, quantity))
+        except OrderBlocked as e:
+            self._update_intent(intent_id, status="FAILED", error=str(e))
+            risk.record_order_block(str(e), symbol, signal_id)
+            return {"status": "blocked", "message": str(e)}
         except AmbiguousBuyError as e:
             contract = e.contract_id or "unknown"
             logger.critical(
@@ -275,6 +357,7 @@ class DerivEngine(BaseEngine):
             return {"status": "error", "message": str(e)}
         finally:
             loop.close()
+            self._order_context = None
 
         if not result:
             self._update_intent(intent_id, status="FAILED", error="Deriv refused the proposal or buy")
@@ -287,7 +370,7 @@ class DerivEngine(BaseEngine):
             quantity=quantity,
             price=result['buy_price'], # Use the actual stake charged
             status="OPEN",  # Contract is open until reconciled
-            reason=reason,
+            reason=f"{reason} | experiment={settings.MACS_EXPERIMENT_ID} config={config_fingerprint()}",
             contract_id=contract_id,
             proposal_id=str(result.get('proposal_id', '')),
             payout=_float_or_none(result.get('payout')),
@@ -318,7 +401,6 @@ class DerivEngine(BaseEngine):
             self._alert(f"RECONCILIATION REQUIRED: contract {contract_id} ({symbol} {side}) bought but not recorded")
             return {"status": "reconciliation_required", "intent_id": intent_id, "contract_id": result['contract_id']}
 
-        t_score = tech_score if tech_score is not None else 0.0
         c_score = confidence if confidence is not None else 0.0
         r_str = regime if regime is not None else "unknown"
 
@@ -331,7 +413,7 @@ class DerivEngine(BaseEngine):
                 price=result['buy_price'],
                 strategy="Deriv Engine",
                 ai_score=ai_score,
-                notes=f"Tech:{t_score:.1f} | Conf:{c_score:.1f} | Reg:{r_str} | ID:{result['contract_id']}",
+                notes=f"Agreement:{c_score:.1f}% (not win probability) | Reg:{r_str} | ID:{result['contract_id']}",
                 contract={
                     "contract_type": result.get('contract_type'),
                     "duration": result.get('duration'),
@@ -442,7 +524,29 @@ class DerivEngine(BaseEngine):
         return []
 
     def get_account_summary(self) -> dict:
-        return {"balance": 0.0}
+        """Read the authenticated demo cash balance; no cached/fallback equity."""
+        response = requests.post(
+            f'https://api.derivws.com/trading/v1/options/accounts/{self.account_id}/otp',
+            headers={'Authorization': f'Bearer {self.token}', 'Deriv-App-ID': self.app_id,
+                     'Content-Type': 'application/json'}, timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        url = _demo_url(response.json()['data']['url'])
+
+        async def read_balance():
+            async with websockets.connect(url, open_timeout=WS_TIMEOUT, close_timeout=5) as ws:
+                await asyncio.wait_for(ws.send(json.dumps({"balance": 1, "req_id": 3})), WS_TIMEOUT)
+                reply = json.loads(await asyncio.wait_for(ws.recv(), WS_TIMEOUT))
+                if reply.get('req_id') != 3 or reply.get('msg_type') != 'balance' or 'error' in reply:
+                    raise ValueError("Balance response not identifiable")
+                info = reply['balance']
+                balance = float(info['balance'])
+                if (info.get('currency') != 'USD' or not math.isfinite(balance) or balance <= 0
+                        or info.get('loginid', self.account_id) != self.account_id):
+                    raise ValueError("Unsupported currency, account or invalid balance")
+                return {"balance": balance, "currency": info['currency'], "account_type": "demo"}
+
+        return asyncio.run(read_balance())
 
     async def _reconcile_contract(self, ws, contract_id: str, req_id: int):
         req = {
@@ -514,7 +618,7 @@ class DerivEngine(BaseEngine):
                 logger.error("Reconciliation failed to get OTP.")
                 return
 
-            ws_url = resp.json()['data']['url']
+            ws_url = _demo_url(resp.json()['data']['url'])
 
             async def run_recon():
                 async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT, close_timeout=5) as ws:
