@@ -49,7 +49,7 @@ def deriv(monkeypatch):
     def install(replies):
         fake = FakeDeriv(replies)
         otp = MagicMock(status_code=200)
-        otp.json.return_value = {"data": {"url": "wss://fake"}}
+        otp.json.return_value = {"data": {"url": "wss://api.derivws.com/trading/v1/options/ws/demo?otp=test"}}
         monkeypatch.setattr(deriv_engine.requests, "post", lambda *a, **kw: otp)
         monkeypatch.setattr(deriv_engine.websockets, "connect", lambda *a, **kw: fake)
         return fake
@@ -128,10 +128,11 @@ def test_older_v3_field_names_are_still_read(deriv):
     assert (trade.exit_spot, trade.entry_spot) == (4289.36, 4291.95)
 
 
-def test_settled_reply_without_a_profit_figure_leaves_the_contract_open(deriv):
+@pytest.mark.parametrize('profit', [None, 'nan', 'inf', '-inf', 'invalid'])
+def test_settled_reply_without_valid_profit_leaves_the_contract_open(deriv, profit):
     reply = _reply("won")
     info = reply["proposal_open_contract"]
-    info.pop("profit")
+    info['profit'] = profit
     _open_trade(info)
     deriv({info["contract_id"]: reply})
 

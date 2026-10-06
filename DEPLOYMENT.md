@@ -1,3 +1,23 @@
+## September 28 loss-control update
+
+Execution now defaults to observation-only (`MACS_EXECUTION_ENABLED=false`).
+Observation and reconciliation continue, but no new contracts are purchased.
+Explicitly enabling demo execution uses per-market rules, fresh demo cash sizing
+(0.25%, capped at 25 USD), one open contract, exposure limits, projected daily
+loss checks and a minimum 80% net payout. Gold remains observation-only.
+Missing or non-finite settlement P&L blocks further execution.
+
+The database was checked read-only on September 28: schema 0004, 99 closed
+contracts, 46 wins, net P&L -2836.60, all at 170-unit stakes. Gold contributed
+-2646.96. This is evidence of losses, not proof of an alternative strategy.
+No database migration is required for this update. Older rollout notes below
+are historical; the open-exposure limitation has been fixed.
+
+Local validation: 187 regression tests and the dashboard build pass. The demo
+balance API was checked without purchasing a contract. GitHub CI builds the
+production Docker image, runs isolated tests inside it, and builds the dashboard.
+No automated job deploys or activates trading.
+
 # Deploying MACS-V2
 
 MACS-V2 is a background worker with no HTTP port. It buys 15-minute CALL/PUT contracts on Deriv
@@ -230,7 +250,7 @@ docker build -t macs-v2 .
 3. **The lock covers a cycle, not a lost connection.** If its database connection drops mid-cycle, a
    second worker could start. Trade intents still stop a second buy on the same symbol, candle
    and direction.
-4. **Open exposure is not limited.** The daily loss limit counts settled contracts only.
+4. **Open exposure is now limited.** Proposed orders include all open stakes in the exposure and daily loss budgets.
 5. **A slow settlement blocks the next cycle.** If Deriv hasn't settled a contract 10 s after
    expiry, that cycle is blocked and the following one continues.
 6. **Eight contracts from 2026-09-14 are not in the database:**

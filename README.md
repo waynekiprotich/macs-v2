@@ -2,6 +2,22 @@
 
 A trading bot for Deriv synthetic/forex Rise-Fall options. Pulls candles, scores them against 8 technical conditions, and fires a CALL or PUT if enough conditions agree.
 
+## September 2026 demo experiment
+
+The new pipeline defaults to observation mode. When explicitly enabled, its
+candidate is OTC_DJI BUY, at least 7/8 conditions, at least 80% net payout,
+15-minute contracts and one open contract at a time. Gold continues collecting
+observations. Stake is 0.25% of fresh demo cash, rounded down and capped at 25 USD;
+it is never increased to recover a loss. These are experimental defaults, not
+evidence of profitability. Existing Railway environment values must be reviewed
+before activation; `.env.example` is a template, not an automatic deployment.
+
+See [EXPERIMENT_GUIDE.md](EXPERIMENT_GUIDE.md) for the effective configuration,
+offline evaluation, test commands, review steps and limitations. The old global
+`MACS_MIN_CONDITIONS` and duration settings remain for legacy research commands;
+the new trading pipeline uses `MACS_MARKET_RULES` instead. No calibrated win
+probability is available; the score is indicator agreement only.
+
 **Status: no demonstrated edge.** The engineering works end-to-end. The strategy itself does not beat the house edge. Read "What actually needs to change" before running this with anything you care about.
 
 ## How it works

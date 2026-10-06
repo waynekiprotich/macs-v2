@@ -22,7 +22,10 @@ def get_signals(limit: int = 20, db: Session = Depends(get_db)):
                 action=log.signal,
                 # SystemLog stores confidence 0-100; the schema wants 0-1.
                 confidence_score=min(1.0, max(0.0, (log.combined_confidence or 0) / 100)),
-                reasoning=log.error_warning or f"regime={log.regime}, volatile={bool(log.is_volatile)}",
+                agreement_score=min(100.0, max(0.0, log.combined_confidence or 0)),
+                action_taken=log.action_taken,
+                price=log.close_price,
+                reasoning=log.error_warning or log.reason or f"regime={log.regime}, volatile={bool(log.is_volatile)}",
                 timestamp=log.timestamp,
             )
             for log in logs
@@ -48,12 +51,19 @@ def get_risk(symbol: str = "ALL"):
             risk_level="BLOCKED" if not status['allowed'] else (
                 "ELEVATED" if rm.consecutive_losses else "NORMAL"
             ),
-            max_position_size=170.0,  # matches the hardcoded stake in pipeline.execute_trade
-            warnings=warnings,
+            max_position_size=None,  # Computed from fresh broker cash immediately before an order.
+            warnings=warnings + ["Stake is computed from the demo balance before each order"],
         )
     except Exception as e:
         logger.error(f"Error fetching risk: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/experiment")
+def get_experiment():
+    from core.experiment import experiment_config, config_fingerprint
+    return {**experiment_config(), "config_fingerprint": config_fingerprint(),
+            "status": "EXPERIMENTAL_NOT_VALIDATED", "score_label": "Indicator agreement, not win probability"}
 
 
 @router.get("/trades")
