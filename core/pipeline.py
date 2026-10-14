@@ -1,3 +1,19 @@
+"""Core trading pipeline for MACS.
+
+Orchestrates the full signal-to-order loop:
+  1. Fetch latest OHLCV candles from the Deriv data provider.
+  2. Compute technical indicators (EMA, RSI, Bollinger Bands, ATR …).
+  3. Detect market regime (bullish / bearish / neutral) and volatility flag.
+  4. Apply the active strategy (technical, experiment, or gold_london_mr).
+  5. Gate the signal through :class:`~core.risk_management.RiskManager`.
+  6. Place the trade via the Deriv execution layer and persist it to the DB.
+
+The pipeline is designed to be called once per closed candle from the
+scheduler (see :mod:`core.scheduler`).  It is re-entrant-safe via
+:func:`~core.instance_lock.trading_lock` so concurrent candle callbacks
+don't double-trade.
+"""
+
 import contextlib
 import logging
 import math
