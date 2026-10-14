@@ -1,8 +1,14 @@
 """Technical + AI scoring for MACS."""
 
-import pandas as pd
+import json
+import logging
+import re
+from typing import Any, Dict, Optional
+
 import numpy as np
-from typing import Optional, Dict, Any
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 def technical_score(df: pd.DataFrame, regime: dict) -> float:
     """
@@ -86,8 +92,6 @@ Be conservative. Only rate bullish if the trend is clearly up."""
         model = gemini_client.GenerativeModel("gemini-2.0-flash")
         response = model.generate_content(prompt)
 
-        import json
-        import re
         text = response.text
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
@@ -98,6 +102,6 @@ Be conservative. Only rate bullish if the trend is clearly up."""
                 "reasoning": result.get("reasoning", ""),
             }
     except Exception as e:
-        pass
+        logger.warning("ai_analysis failed for %s: %s", symbol, e)
 
     return {"direction": "neutral", "confidence": 0.5, "reasoning": "AI analysis failed"}
