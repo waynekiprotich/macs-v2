@@ -17,3 +17,6 @@ dist/
 .backtest_cache/
 # research data artifacts
 *.pyc
+
+# Local env overrides
+.env.local
