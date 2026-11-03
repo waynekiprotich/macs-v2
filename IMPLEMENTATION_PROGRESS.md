@@ -48,3 +48,4 @@ Read-only current database: 99 closed trades, 46 wins, net -2836.60; Gold -2646.
 All stakes remain 170 in the deployed history. Local regression suite: 187 passed.
 Authenticated demo balance lookup passed without placing orders. Invalid settlement
 values now block risk decisions; CI verifies the worker image and dashboard build.
+
