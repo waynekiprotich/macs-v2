@@ -20,3 +20,6 @@ dist/
 
 # Local env overrides
 .env.local
+
+# macOS metadata
+.DS_Store
