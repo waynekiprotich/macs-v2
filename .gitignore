@@ -38,3 +38,8 @@ __pycache__/
 .vscode/
 *.swp
 *.swo
+
+# Build / dist artifacts
+dist/
+build/
+*.egg-info/
