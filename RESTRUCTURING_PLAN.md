@@ -46,3 +46,4 @@ Current source: core/pipeline.py requests a fixed 170-unit stake; core/risk_mana
 - Complete: preliminary local-data and source review; planning document.
 - Pending: current authoritative data, broker reconciliation and full loss attribution.
 - Pending: implementation, backtests and prospective demo validation. No trading settings were changed during planning.
+
