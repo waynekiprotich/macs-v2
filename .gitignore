@@ -32,3 +32,9 @@ env/
 # pytest cache
 .pytest_cache/
 __pycache__/
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
