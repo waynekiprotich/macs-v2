@@ -91,3 +91,4 @@ websockets==10.3
 xgboost==3.4.1
 yarl==1.24.5
 yfinance==0.2.54
+
