@@ -15,3 +15,4 @@ venv/
 node_modules/
 dist/
 .backtest_cache/
+# research data artifacts
