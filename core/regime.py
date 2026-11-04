@@ -1,7 +1,19 @@
+"""Market regime detection for MACS.
+
+Classifies each bar as 'bullish', 'bearish', or 'neutral' using a
+SMA-50/SMA-200 golden/death-cross rule. A separate boolean column
+``Is_Volatile`` is set when the current ATR is more than 30% above its
+20-bar rolling average, so downstream strategies can opt out of noisy
+conditions without losing regime information.
+"""
+
 import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Valid regime label strings returned by detect_regime.
+REGIME_LABELS: tuple = ("bullish", "bearish", "neutral")
 
 def detect_regime(df: pd.DataFrame) -> pd.DataFrame:
     """Detect market regime."""

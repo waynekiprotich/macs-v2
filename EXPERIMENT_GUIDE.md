@@ -131,3 +131,4 @@ decisions. Existing `ml/train.py` remains research tooling; adding a probability
 to the trading path requires independent calibration and forward validation.
 Reducing correlated trend votes would change the meaning of 7/8 and requires a
 separate, versioned scoring experiment rather than silently modifying this one.
+

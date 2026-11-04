@@ -1,3 +1,10 @@
+"""Technical indicator computations for MACS strategies.
+
+All functions operate on a DataFrame with OHLCV columns (Open, High, Low,
+Close, Volume). They return a *copy* of the input with new columns appended;
+the caller's original frame is never mutated.
+"""
+
 import pandas as pd
 import numpy as np
 from ta.trend import SMAIndicator, EMAIndicator, MACD
@@ -7,6 +14,10 @@ from ta.volume import VolumeWeightedAveragePrice
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Minimum number of rows required before any indicator makes sense.
+MIN_ROWS: int = 200
+
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Compute various technical indicators."""

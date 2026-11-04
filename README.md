@@ -101,3 +101,4 @@ Lagging trend indicators (SMA/EMA/MACD/RSI/Stochastic) describe where price *has
 4. **Treat it as a learning project**, not an income source. The framework built here (`equity-backtest`, `performance`, the daemon) will honestly tell you the truth about any future idea in minutes — that's the reusable part.
 
 See the full backtest output and reasoning in the conversation history — this file is the short version.
+

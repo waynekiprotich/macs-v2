@@ -15,3 +15,31 @@ venv/
 node_modules/
 dist/
 .backtest_cache/
+# research data artifacts
+*.pyc
+
+# Local env overrides
+.env.local
+
+# macOS metadata
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# pytest cache
+.pytest_cache/
+__pycache__/
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build / dist artifacts
+dist/
+build/
+*.egg-info/

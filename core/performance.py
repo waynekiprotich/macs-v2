@@ -20,7 +20,21 @@ def _quoted_payout(trade: PaperTrade) -> Optional[float]:
     return trade.payout if trade.payout else None
 
 
-def compute_metrics(symbol: str = None) -> Dict[str, Any]:
+def compute_metrics(symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Compute live performance metrics from all closed trades in the DB.
+
+    Args:
+        symbol: If provided, restrict metrics to trades on this symbol.
+                Pass ``None`` (default) to aggregate across all symbols.
+
+    Returns:
+        A dict with keys: trade_count, wins, losses, breakeven,
+        win_rate_pct, gross_profit, gross_loss, net_pnl, profit_factor,
+        avg_win, avg_loss, reward_risk_ratio, max_drawdown,
+        worst_losing_streak, avg_payout_ratio, breakeven_win_rate,
+        by_confidence_bucket.  Returns ``{"trade_count": 0, "message": ...}``
+        when there are no closed trades yet.
+    """
     db = SessionLocal()
     try:
         query = db.query(PaperTrade).filter(PaperTrade.status == 'CLOSED')

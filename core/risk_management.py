@@ -1,3 +1,20 @@
+"""Runtime risk management for MACS live/demo trading.
+
+The central class is :class:`RiskManager`, which enforces daily loss limits,
+concurrent-trade caps, and per-session drawdown guards before every trade
+decision.  All state is persisted in the SQLite/Supabase database so the
+daemon can restart without losing its loss-limit counters.
+
+Key design choices:
+- State is re-read from the DB on every ``can_trade()`` call; the caller
+  must not cache a ``RiskState`` object across candles.
+- ``MAX_STATE_AGE`` forces a re-fetch if the cached state is stale, so a
+  decision always reflects contracts that settled since the last read.
+- Expiring OPEN contracts block new trades until reconciliation settles them;
+  the ``EXPIRY_MARGIN`` window prevents races between settlement and the
+  next candle signal.
+"""
+
 import datetime
 import logging
 import math
